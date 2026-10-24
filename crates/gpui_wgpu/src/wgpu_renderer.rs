@@ -1,10 +1,11 @@
 use crate::{CompositorGpuHint, DeviceErrorState, WgpuAtlas, WgpuContext};
 use anyhow::{Context as _, Result};
 use bytemuck::{Pod, Zeroable};
-use collections::FxHashMap;
+use collections::{FxHashMap, FxHashSet};
 use gpui::{
-    AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, UnsupportedExternalSurfaces, get_gamma_correction_ratios,
+    AtlasTextureId, Background, Bounds, CpuNv12Frame, DevicePixels, ExternalStreamId,
+    ExternalSurface, GpuSpecs, PaintExternalSurface, Path, Point, PrimitiveBatch, ScaledPixels,
+    Scene, Size, UnsupportedExternalSurfaces, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -15,10 +16,17 @@ use std::num::NonZeroU64;
 use std::ops::Range;
 use std::rc::Rc;
 use std::sync::Arc;
+use wgpu::util::DeviceExt as _;
 
 const MAX_INSTANCE_BUFFER_SIZE: u64 = 256 * 1024 * 1024;
 
 const INSTANCE_TEXTURE_TEXEL_SIZE: u64 = 16;
+
+/// Rendered frames after which a CPU NV12 stream that was not drawn gives up its textures.
+const EXTERNAL_TEXTURE_IDLE_FRAMES: u64 = 120;
+
+/// The name this renderer logs external surfaces it skips under.
+const RENDERER_NAME: &str = "wgpu";
 
 /// Shader variant for backends with storage buffer support: the shared shader
 /// logic plus the storage-buffer instance transport.
@@ -84,6 +92,7 @@ impl From<Bounds<ScaledPixels>> for PodBounds {
 struct SurfaceParams {
     bounds: PodBounds,
     content_mask: PodBounds,
+    ycbcr_to_rgb: [[f32; 4]; 4],
 }
 
 #[repr(C)]
@@ -132,7 +141,6 @@ struct WgpuPipelines {
     mono_sprites: wgpu::RenderPipeline,
     subpixel_sprites: Option<wgpu::RenderPipeline>,
     poly_sprites: wgpu::RenderPipeline,
-    #[allow(dead_code)]
     surfaces: wgpu::RenderPipeline,
 }
 
@@ -194,11 +202,116 @@ struct WgpuResources {
     path_intermediate_view: Option<wgpu::TextureView>,
     path_msaa_texture: Option<wgpu::Texture>,
     path_msaa_view: Option<wgpu::TextureView>,
+    external_textures: FxHashMap<ExternalStreamId, Nv12StreamTextures>,
 }
 
 struct CachedTextureBindGroup {
     texture_generation: u64,
     bind_group: wgpu::BindGroup,
+}
+
+/// The luma (R8) and chroma (RG8) textures of one CPU NV12 stream, kept across frames so
+/// that only a new generation uploads.
+struct Nv12StreamTextures {
+    width: u32,
+    height: u32,
+    uploaded_generation: Option<u64>,
+    last_drawn_frame: u64,
+    y_texture: wgpu::Texture,
+    y_view: wgpu::TextureView,
+    uv_texture: wgpu::Texture,
+    uv_view: wgpu::TextureView,
+}
+
+impl Nv12StreamTextures {
+    fn new(device: &wgpu::Device, frame: &CpuNv12Frame) -> Self {
+        let layout = frame.layout();
+        let plane = |label, format, width, height| {
+            let texture = device.create_texture(&wgpu::TextureDescriptor {
+                label: Some(label),
+                size: wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format,
+                usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                view_formats: &[],
+            });
+            let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+            (texture, view)
+        };
+        let (y_texture, y_view) = plane(
+            "nv12_luma",
+            wgpu::TextureFormat::R8Unorm,
+            layout.width.get(),
+            layout.height.get(),
+        );
+        let (uv_texture, uv_view) = plane(
+            "nv12_chroma",
+            wgpu::TextureFormat::Rg8Unorm,
+            layout.chroma_width(),
+            layout.chroma_height(),
+        );
+        Self {
+            width: layout.width.get(),
+            height: layout.height.get(),
+            uploaded_generation: None,
+            last_drawn_frame: 0,
+            y_texture,
+            y_view,
+            uv_texture,
+            uv_view,
+        }
+    }
+
+    fn fits(&self, frame: &CpuNv12Frame) -> bool {
+        let layout = frame.layout();
+        self.width == layout.width.get() && self.height == layout.height.get()
+    }
+
+    fn upload(&mut self, queue: &wgpu::Queue, frame: &CpuNv12Frame) {
+        let layout = frame.layout();
+        let write_plane = |texture, bytes, stride, width, height| {
+            queue.write_texture(
+                wgpu::TexelCopyTextureInfo {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                bytes,
+                wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(stride),
+                    rows_per_image: Some(height),
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            )
+        };
+        write_plane(
+            &self.y_texture,
+            frame.y_plane(),
+            layout.y_stride,
+            layout.width.get(),
+            layout.height.get(),
+        );
+        write_plane(
+            &self.uv_texture,
+            frame.uv_plane(),
+            layout.uv_stride,
+            layout.chroma_width(),
+            layout.chroma_height(),
+        );
+        self.uploaded_generation = Some(frame.generation());
+    }
 }
 
 impl WgpuResources {
@@ -226,6 +339,8 @@ struct WgpuRendererCore {
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
     unsupported_external_surfaces: UnsupportedExternalSurfaces,
+    oversized_external_streams: FxHashSet<ExternalStreamId>,
+    rendered_frames: u64,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1348,6 +1463,7 @@ impl WgpuRendererCore {
                 path_intermediate_view: None,
                 path_msaa_texture: None,
                 path_msaa_view: None,
+                external_textures: FxHashMap::default(),
             },
             atlas,
             path_globals_offset,
@@ -1363,6 +1479,8 @@ impl WgpuRendererCore {
             target_format,
             max_texture_size,
             unsupported_external_surfaces: UnsupportedExternalSurfaces::default(),
+            oversized_external_streams: FxHashSet::default(),
+            rendered_frames: 0,
         }
     }
 
@@ -1493,6 +1611,7 @@ impl WgpuRendererCore {
                 )
             })?;
         self.prepare_texture_bind_groups(scene);
+        let external_surface_bind_groups = self.prepare_external_surfaces(scene);
 
         let mut encoder =
             self.resources()
@@ -1608,9 +1727,9 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
-                    PrimitiveBatch::ExternalSurfaces(range) => self
-                        .unsupported_external_surfaces
-                        .skip_all("wgpu", &scene.external_surfaces[range]),
+                    PrimitiveBatch::ExternalSurfaces(range) => {
+                        self.draw_external_surfaces(&external_surface_bind_groups[range], &mut pass)
+                    }
                 }
             }
         }
@@ -1728,6 +1847,119 @@ impl WgpuRendererCore {
                     bind_group,
                 },
             );
+        }
+    }
+
+    /// Uploads the CPU NV12 frames of a new generation, binds each drawable external surface
+    /// of `scene` (`None` for one this renderer skips) and evicts streams that stayed idle.
+    fn prepare_external_surfaces(&mut self, scene: &Scene) -> Vec<Option<wgpu::BindGroup>> {
+        self.rendered_frames += 1;
+        let mut bind_groups = Vec::with_capacity(scene.external_surfaces.len());
+        for painted in &scene.external_surfaces {
+            let bind_group = match &painted.surface {
+                ExternalSurface::CpuNv12(frame) => self.prepare_nv12_surface(painted, frame),
+                ExternalSurface::D3D11Shared(_) => {
+                    self.unsupported_external_surfaces
+                        .skip(RENDERER_NAME, painted.surface.kind());
+                    None
+                }
+            };
+            bind_groups.push(bind_group);
+        }
+        let rendered_frames = self.rendered_frames;
+        self.resources.external_textures.retain(|_, textures| {
+            rendered_frames - textures.last_drawn_frame < EXTERNAL_TEXTURE_IDLE_FRAMES
+        });
+        bind_groups
+    }
+
+    fn prepare_nv12_surface(
+        &mut self,
+        painted: &PaintExternalSurface,
+        frame: &CpuNv12Frame,
+    ) -> Option<wgpu::BindGroup> {
+        let layout = frame.layout();
+        if layout.width.get() > self.max_texture_size || layout.height.get() > self.max_texture_size
+        {
+            if self.oversized_external_streams.insert(frame.stream()) {
+                log::error!(
+                    "external surface stream {:?} is {}x{}, above the {} texture limit of this GPU; skipping it",
+                    frame.stream(),
+                    layout.width,
+                    layout.height,
+                    self.max_texture_size
+                );
+            }
+            return None;
+        }
+
+        let resources = &mut self.resources;
+        let textures = resources
+            .external_textures
+            .entry(frame.stream())
+            .and_modify(|textures| {
+                if !textures.fits(frame) {
+                    *textures = Nv12StreamTextures::new(&resources.device, frame);
+                }
+            })
+            .or_insert_with(|| Nv12StreamTextures::new(&resources.device, frame));
+        if textures.uploaded_generation != Some(frame.generation()) {
+            textures.upload(&resources.queue, frame);
+        }
+        textures.last_drawn_frame = self.rendered_frames;
+
+        let params = SurfaceParams {
+            bounds: painted.bounds.into(),
+            content_mask: painted.content_mask.bounds.into(),
+            ycbcr_to_rgb: frame.color().ycbcr_to_rgb(),
+        };
+        let params_buffer =
+            resources
+                .device
+                .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                    label: Some("external_surface_params"),
+                    contents: bytemuck::bytes_of(&params),
+                    usage: wgpu::BufferUsages::UNIFORM,
+                });
+        Some(
+            resources
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("external_surface_bind_group"),
+                    layout: &resources.bind_group_layouts.surfaces,
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: params_buffer.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: wgpu::BindingResource::TextureView(&textures.y_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: wgpu::BindingResource::TextureView(&textures.uv_view),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: wgpu::BindingResource::Sampler(&resources.atlas_sampler),
+                        },
+                    ],
+                }),
+        )
+    }
+
+    fn draw_external_surfaces(
+        &self,
+        bind_groups: &[Option<wgpu::BindGroup>],
+        pass: &mut wgpu::RenderPass<'_>,
+    ) {
+        let resources = self.resources();
+        pass.set_pipeline(&resources.pipelines.surfaces);
+        pass.set_bind_group(0, &resources.globals_bind_group, &[]);
+        for bind_group in bind_groups.iter().flatten() {
+            pass.set_bind_group(1, bind_group, &[]);
+            pass.draw(0..4, 0..1);
         }
     }
 
@@ -2768,6 +3000,416 @@ mod tests {
         let image = renderer.render_scene_to_image(&Scene::default(), device_size(4, 4))?;
         assert_eq!(image.dimensions(), (4, 4));
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    const GREY: [u8; 4] = [128, 128, 128, 255];
+    #[cfg(target_os = "linux")]
+    const WHITE: [u8; 4] = [255, 255, 255, 255];
+    #[cfg(target_os = "linux")]
+    const BT601_FULL_TOLERANCE: u8 = 2;
+    #[cfg(target_os = "linux")]
+    const BT709_LIMITED_TOLERANCE: u8 = 3;
+    #[cfg(target_os = "linux")]
+    const TARGET_SIDE: i32 = 16;
+
+    #[cfg(target_os = "linux")]
+    fn dimension(value: u32) -> std::num::NonZeroU32 {
+        std::num::NonZeroU32::new(value).expect("test dimensions are not zero")
+    }
+
+    /// A packed NV12 frame whose every sample is `(luma, cb, cr)`.
+    #[cfg(target_os = "linux")]
+    fn uniform_nv12(
+        stream: ExternalStreamId,
+        generation: u64,
+        width: u32,
+        height: u32,
+        (luma, cb, cr): (u8, u8, u8),
+        color: gpui::YuvColorMatrix,
+    ) -> CpuNv12Frame {
+        let layout = gpui::Nv12Layout::packed(dimension(width), dimension(height));
+        let chroma_pairs = (layout.chroma_width() * layout.chroma_height()) as usize;
+        CpuNv12Frame::new(
+            stream,
+            generation,
+            layout,
+            vec![luma; (width * height) as usize],
+            [cb, cr].repeat(chroma_pairs),
+            color,
+        )
+        .expect("packed planes hold every row")
+    }
+
+    #[cfg(target_os = "linux")]
+    fn painted_at(
+        surface: impl Into<ExternalSurface>,
+        x: f32,
+        y: f32,
+        width: f32,
+        height: f32,
+    ) -> PaintExternalSurface {
+        let bounds = Bounds {
+            origin: Point {
+                x: x.into(),
+                y: y.into(),
+            },
+            size: Size {
+                width: width.into(),
+                height: height.into(),
+            },
+        };
+        PaintExternalSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            surface: surface.into(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn painted_full(surface: impl Into<ExternalSurface>) -> PaintExternalSurface {
+        let side = TARGET_SIDE as f32;
+        painted_at(surface, 0.0, 0.0, side, side)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn render_surfaces(
+        renderer: &mut WgpuHeadlessRenderer,
+        surfaces: impl IntoIterator<Item = PaintExternalSurface>,
+    ) -> anyhow::Result<image::RgbaImage> {
+        let mut scene = Scene::default();
+        for surface in surfaces {
+            scene.insert_primitive(surface);
+        }
+        scene.finish();
+        renderer.render_scene_to_image(&scene, device_size(TARGET_SIDE, TARGET_SIDE))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_region(
+        image: &image::RgbaImage,
+        inside: impl Fn(u32, u32) -> bool,
+        expected: [u8; 4],
+        tolerance: u8,
+    ) {
+        for (x, y, pixel) in image.enumerate_pixels() {
+            if !inside(x, y) {
+                continue;
+            }
+            assert!(
+                pixel
+                    .0
+                    .iter()
+                    .zip(expected)
+                    .all(|(actual, expected)| actual.abs_diff(expected) <= tolerance),
+                "pixel ({x}, {y}) was {:?}, expected {expected:?} within {tolerance}",
+                pixel.0
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn assert_every_pixel(image: &image::RgbaImage, expected: [u8; 4], tolerance: u8) {
+        assert_region(image, |_, _| true, expected, tolerance);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn has_stream_textures(renderer: &WgpuHeadlessRenderer, stream: ExternalStreamId) -> bool {
+        renderer
+            .core
+            .resources
+            .external_textures
+            .contains_key(&stream)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_bt601_full_grey_is_within_two_levels() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let frame = uniform_nv12(
+            ExternalStreamId::new(),
+            0,
+            16,
+            16,
+            (128, 128, 128),
+            gpui::YuvColorMatrix::Bt601Full,
+        );
+        let image = render_surfaces(&mut renderer, [painted_full(frame)])?;
+        assert_every_pixel(&image, GREY, BT601_FULL_TOLERANCE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_bt709_limited_grey_is_within_three_levels() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let frame = uniform_nv12(
+            ExternalStreamId::new(),
+            0,
+            16,
+            16,
+            (126, 128, 128),
+            gpui::YuvColorMatrix::Bt709Limited,
+        );
+        let image = render_surfaces(&mut renderer, [painted_full(frame)])?;
+        assert_every_pixel(&image, GREY, BT709_LIMITED_TOLERANCE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_bt709_limited_stretches_16_and_235_to_black_and_white() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        for (luma, expected) in [(16, BLACK), (235, WHITE)] {
+            let frame = uniform_nv12(
+                ExternalStreamId::new(),
+                0,
+                16,
+                16,
+                (luma, 128, 128),
+                gpui::YuvColorMatrix::Bt709Limited,
+            );
+            let image = render_surfaces(&mut renderer, [painted_full(frame)])?;
+            assert_every_pixel(&image, expected, BT709_LIMITED_TOLERANCE);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_each_matrix_decodes_its_own_red() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        for (samples, color) in [
+            ((76, 85, 255), gpui::YuvColorMatrix::Bt601Full),
+            ((63, 102, 240), gpui::YuvColorMatrix::Bt709Limited),
+            ((54, 99, 255), gpui::YuvColorMatrix::Bt709Full),
+        ] {
+            let frame = uniform_nv12(ExternalStreamId::new(), 0, 16, 16, samples, color);
+            let image = render_surfaces(&mut renderer, [painted_full(frame)])?;
+            assert_every_pixel(&image, RED, BT709_LIMITED_TOLERANCE);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_uploads_only_a_new_generation() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let stream = ExternalStreamId::new();
+        let frame = |generation, luma| {
+            painted_full(uniform_nv12(
+                stream,
+                generation,
+                16,
+                16,
+                (luma, 128, 128),
+                gpui::YuvColorMatrix::Bt601Full,
+            ))
+        };
+
+        let image = render_surfaces(&mut renderer, [frame(1, 128)])?;
+        assert_every_pixel(&image, GREY, BT601_FULL_TOLERANCE);
+        let image = render_surfaces(&mut renderer, [frame(1, 255)])?;
+        assert_every_pixel(&image, GREY, BT601_FULL_TOLERANCE);
+        let image = render_surfaces(&mut renderer, [frame(2, 255)])?;
+        assert_every_pixel(&image, WHITE, BT601_FULL_TOLERANCE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_textures_are_evicted_after_120_idle_frames() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let stream = ExternalStreamId::new();
+        let frame = || {
+            painted_full(uniform_nv12(
+                stream,
+                1,
+                16,
+                16,
+                (128, 128, 128),
+                gpui::YuvColorMatrix::Bt601Full,
+            ))
+        };
+        let idle_frame = |renderer: &mut WgpuHeadlessRenderer| {
+            renderer.render_scene(&Scene::default(), device_size(TARGET_SIDE, TARGET_SIDE))
+        };
+
+        render_surfaces(&mut renderer, [frame()])?;
+        for _ in 1..EXTERNAL_TEXTURE_IDLE_FRAMES {
+            idle_frame(&mut renderer)?;
+        }
+        assert!(has_stream_textures(&renderer, stream));
+        idle_frame(&mut renderer)?;
+        assert!(!has_stream_textures(&renderer, stream));
+
+        let image = render_surfaces(&mut renderer, [frame()])?;
+        assert_every_pixel(&image, GREY, BT601_FULL_TOLERANCE);
+        assert!(has_stream_textures(&renderer, stream));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_drawn_streams_keep_their_textures() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let drawn = ExternalStreamId::new();
+        let idle = ExternalStreamId::new();
+        let frame = |stream| {
+            painted_full(uniform_nv12(
+                stream,
+                1,
+                16,
+                16,
+                (128, 128, 128),
+                gpui::YuvColorMatrix::Bt601Full,
+            ))
+        };
+
+        render_surfaces(&mut renderer, [frame(idle)])?;
+        for _ in 0..EXTERNAL_TEXTURE_IDLE_FRAMES {
+            render_surfaces(&mut renderer, [frame(drawn)])?;
+        }
+        assert!(has_stream_textures(&renderer, drawn));
+        assert!(!has_stream_textures(&renderer, idle));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_size_change_rebuilds_the_stream_textures() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let stream = ExternalStreamId::new();
+        let frame = |generation, side, luma| {
+            painted_full(uniform_nv12(
+                stream,
+                generation,
+                side,
+                side,
+                (luma, 128, 128),
+                gpui::YuvColorMatrix::Bt601Full,
+            ))
+        };
+
+        render_surfaces(&mut renderer, [frame(1, 16, 128)])?;
+        let image = render_surfaces(&mut renderer, [frame(2, 8, 255)])?;
+        assert_every_pixel(&image, WHITE, BT601_FULL_TOLERANCE);
+        let textures = &renderer.core.resources.external_textures[&stream];
+        assert_eq!((textures.width, textures.height), (8, 8));
+        assert_eq!(textures.uv_texture.size().width, 4);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_honours_strides_and_bounds() -> anyhow::Result<()> {
+        const SIDE: u32 = 8;
+        const Y_STRIDE: u32 = 32;
+        const UV_STRIDE: u32 = 24;
+        const PADDING: u8 = 0;
+        let layout = gpui::Nv12Layout {
+            y_stride: Y_STRIDE,
+            uv_stride: UV_STRIDE,
+            ..gpui::Nv12Layout::packed(dimension(SIDE), dimension(SIDE))
+        };
+        let padded_rows = |rows: u32, stride: u32, row: &[u8]| {
+            let mut plane = Vec::new();
+            for _ in 0..rows {
+                plane.extend_from_slice(row);
+                plane.resize(plane.len() + stride as usize - row.len(), PADDING);
+            }
+            plane
+        };
+        let frame = CpuNv12Frame::new(
+            ExternalStreamId::new(),
+            0,
+            layout,
+            padded_rows(SIDE, Y_STRIDE, &[255; SIDE as usize]),
+            padded_rows(SIDE / 2, UV_STRIDE, &[128; SIDE as usize]),
+            gpui::YuvColorMatrix::Bt601Full,
+        )
+        .expect("padded planes hold every row");
+
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let image = render_surfaces(&mut renderer, [painted_at(frame, 4.0, 4.0, 8.0, 8.0)])?;
+        let inside = |x: u32, y: u32| (4..12).contains(&x) && (4..12).contains(&y);
+        assert_region(&image, inside, WHITE, BT601_FULL_TOLERANCE);
+        assert_region(&image, |x, y| !inside(x, y), BLACK, 0);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_odd_dimensions_render() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let frame = uniform_nv12(
+            ExternalStreamId::new(),
+            0,
+            5,
+            3,
+            (128, 128, 128),
+            gpui::YuvColorMatrix::Bt601Full,
+        );
+        let image = render_surfaces(&mut renderer, [painted_full(frame)])?;
+        assert_every_pixel(&image, GREY, BT601_FULL_TOLERANCE);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn nv12_frames_above_the_texture_limit_are_skipped() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let stream = ExternalStreamId::new();
+        let frame = uniform_nv12(
+            stream,
+            0,
+            renderer.core.max_texture_size + 1,
+            1,
+            (128, 128, 128),
+            gpui::YuvColorMatrix::Bt601Full,
+        );
+        for _ in 0..2 {
+            let image = render_surfaces(&mut renderer, [painted_full(frame.clone())])?;
+            assert_every_pixel(&image, BLACK, 0);
+        }
+        assert!(renderer.core.oversized_external_streams.contains(&stream));
+        assert!(!has_stream_textures(&renderer, stream));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn d3d11_shared_surfaces_are_skipped() -> anyhow::Result<()> {
+        let mut renderer = WgpuHeadlessRenderer::new()?;
+        let frame = gpui::D3D11SharedFrame {
+            stream: ExternalStreamId::new(),
+            generation: 1,
+            nt_handle: 1,
+            width: dimension(16),
+            height: dimension(16),
+            array_slice: 0,
+            keyed_mutex: None,
+            color: gpui::YuvColorMatrix::Bt709Limited,
+        };
+        for _ in 0..2 {
+            let image = render_surfaces(&mut renderer, [painted_full(frame)])?;
+            assert_every_pixel(&image, BLACK, 0);
+        }
+        assert!(
+            !renderer
+                .core
+                .unsupported_external_surfaces
+                .skip(RENDERER_NAME, gpui::ExternalSurfaceKind::D3D11Shared),
+            "the first skipped frame should already have been reported"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn surface_params_match_the_wgsl_uniform_layout() {
+        assert_eq!(std::mem::size_of::<SurfaceParams>(), 24 * 4);
+        assert_eq!(std::mem::offset_of!(SurfaceParams, ycbcr_to_rgb), 8 * 4);
     }
 
     #[test]
