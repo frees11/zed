@@ -44,7 +44,7 @@ log.workspace = true
 objc2.workspace = true
 objc2-foundation = { workspace = true, features = ["NSThread", "NSOperation", "NSUserActivity", "block2"] }
 objc2-ui-kit = { workspace = true, features = ["UIKey", "UIKeyConstants", "UIPress", "UIPressesEvent"] }
-objc2-quartz-core = { workspace = true, features = ["CADisplayLink"] }
+objc2-quartz-core = { workspace = true, features = ["CADisplayLink", "CAFrameRateRange"] }
 objc2-core-foundation = { workspace = true, default-features = true }
 parking_lot.workspace = true
 raw-window-handle.workspace = true

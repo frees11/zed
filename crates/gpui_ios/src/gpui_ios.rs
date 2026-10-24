@@ -8,6 +8,8 @@
 pub mod ios;
 
 #[cfg(any(target_os = "ios", test))]
+mod frame_rate;
+#[cfg(any(target_os = "ios", test))]
 mod keyboard;
 
 #[cfg(target_os = "ios")]

@@ -1,4 +1,5 @@
 use super::{CallbackSlot, platform::IosPlatformState, window::IosWindowState};
+use crate::frame_rate::preferred_frame_rate_range;
 use gpui::{AppLifecyclePhase, WindowVisibility};
 use gpui_apple::main_thread_marker;
 use objc2::{
@@ -12,7 +13,7 @@ use objc2_foundation::{
     NSDictionary, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSSet, NSString,
     NSUserActivity, NSUserActivityTypeBrowsingWeb,
 };
-use objc2_quartz_core::CADisplayLink;
+use objc2_quartz_core::{CADisplayLink, CAFrameRateRange};
 use objc2_ui_kit::{
     UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIOpenURLContext, UIScene,
     UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIWindowScene,
@@ -339,6 +340,15 @@ define_class!(
                 );
                 display_link
             };
+            if let Some(range) =
+                preferred_frame_rate_range(scene.screen().maximumFramesPerSecond())
+            {
+                display_link.setPreferredFrameRateRange(CAFrameRateRange {
+                    minimum: range.minimum,
+                    maximum: range.maximum,
+                    preferred: range.preferred,
+                });
+            }
             *application.display_link.borrow_mut() = Some(display_link);
         }
 
