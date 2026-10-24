@@ -1,4 +1,5 @@
 use crate::metal_atlas::MetalAtlas;
+use crate::surface_color::SurfaceColor;
 use anyhow::{Context as _, Result};
 use block2::RcBlock;
 use core_graphics::geometry::CGSize;
@@ -18,9 +19,9 @@ use metal::{
 };
 use objc2_core_foundation::CFRetained;
 use objc2_core_video::{
-    CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture, CVPixelBufferGetHeight,
-    CVPixelBufferGetHeightOfPlane, CVPixelBufferGetPixelFormatType, CVPixelBufferGetWidth,
-    CVPixelBufferGetWidthOfPlane, kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, kCVReturnSuccess,
+    CVImageBuffer, CVMetalTexture, CVMetalTextureCache, CVMetalTextureGetTexture,
+    CVPixelBufferGetHeight, CVPixelBufferGetHeightOfPlane, CVPixelBufferGetWidth,
+    CVPixelBufferGetWidthOfPlane, kCVReturnSuccess,
 };
 use parking_lot::Mutex;
 
@@ -131,6 +132,7 @@ pub struct MetalRenderer {
     instance_buffer_pool: Arc<Mutex<InstanceBufferPool>>,
     sprite_atlas: Arc<MetalAtlas>,
     core_video_texture_cache: CFRetained<CVMetalTextureCache>,
+    suppressed_surface_errors: Option<usize>,
     path_intermediate_texture: Option<metal::Texture>,
     path_intermediate_msaa_texture: Option<metal::Texture>,
     path_sample_count: u32,
@@ -432,6 +434,7 @@ impl MetalRenderer {
             instance_buffer_pool,
             sprite_atlas,
             core_video_texture_cache,
+            suppressed_surface_errors: None,
             path_intermediate_texture: None,
             path_intermediate_msaa_texture: None,
             path_sample_count: PATH_SAMPLE_COUNT,
@@ -585,27 +588,45 @@ impl MetalRenderer {
                 scene.surfaces.len(),
             )
         })?;
+        let mut surface_resources = Vec::new();
         let command_buffer = self.draw_primitives_to_texture(
             scene,
             &instance_bindings,
             &mut writer,
             texture,
             viewport_size,
+            &mut surface_resources,
         )?;
 
+        self.retain_frame_resources(&command_buffer, writer.finish(), surface_resources);
+        Ok(command_buffer)
+    }
+
+    fn retain_frame_resources(
+        &self,
+        command_buffer: &metal::CommandBufferRef,
+        instance_buffer: InstanceBuffer,
+        surface_resources: Vec<CFRetained<CVImageBuffer>>,
+    ) {
         let instance_buffer_pool = self.instance_buffer_pool.clone();
-        let instance_buffer = Cell::new(Some(writer.finish()));
+        let instance_buffer = Cell::new(Some(instance_buffer));
+        // Destroying the cache before its in-flight textures can leave their pool allocation pinned.
+        let core_video_texture_cache =
+            (!surface_resources.is_empty()).then(|| self.core_video_texture_cache.clone());
+        let surface_resources = Cell::new(Some((surface_resources, core_video_texture_cache)));
         let block = RcBlock::new(move |_: ptr::NonNull<AnyObject>| {
             if let Some(instance_buffer) = instance_buffer.take() {
                 instance_buffer_pool.lock().release(instance_buffer);
+            }
+            if let Some((surface_resources, core_video_texture_cache)) = surface_resources.take() {
+                drop(surface_resources);
+                drop(core_video_texture_cache);
             }
         });
         // SAFETY: Both pointee types are opaque views of the same Objective-C block pointer ABI.
         unsafe {
             command_buffer.add_completed_handler(&*RcBlock::as_ptr(&block).cast());
         }
-
-        Ok(command_buffer)
     }
 
     /// Renders the scene to a texture and returns the pixel data as an RGBA image.
@@ -746,6 +767,7 @@ impl MetalRenderer {
         writer: &mut InstanceBufferWriter,
         texture: &metal::TextureRef,
         viewport_size: Size<DevicePixels>,
+        surface_resources: &mut Vec<CFRetained<CVImageBuffer>>,
     ) -> Result<metal::CommandBuffer> {
         let command_queue = self.command_queue.clone();
         let command_buffer = command_queue.new_command_buffer();
@@ -821,6 +843,7 @@ impl MetalRenderer {
                     instance_bindings,
                     viewport_size,
                     command_encoder,
+                    surface_resources,
                 ),
                 PrimitiveBatch::ExternalSurfaces(range) => self
                     .unsupported_external_surfaces
@@ -1213,6 +1236,15 @@ impl MetalRenderer {
         );
     }
 
+    fn log_surface_error(&mut self, error: impl std::fmt::Display) {
+        if let Some(suppressed) = &mut self.suppressed_surface_errors {
+            *suppressed = suppressed.saturating_add(1);
+        } else {
+            log::error!("skipping surface: {error}");
+            self.suppressed_surface_errors = Some(0);
+        }
+    }
+
     fn draw_surfaces(
         &mut self,
         surfaces: &[PaintSurface],
@@ -1220,6 +1252,7 @@ impl MetalRenderer {
         instance_bindings: &InstanceBindings,
         viewport_size: Size<DevicePixels>,
         command_encoder: &metal::RenderCommandEncoderRef,
+        surface_resources: &mut Vec<CFRetained<CVImageBuffer>>,
     ) {
         if surfaces.is_empty() {
             return;
@@ -1244,59 +1277,78 @@ impl MetalRenderer {
 
         for (index, surface) in surfaces.iter().enumerate() {
             let image_buffer = &surface.image_buffer;
+            // Panicking here would release the encoder without ending it, which makes
+            // Metal abort the process, so surfaces that can't be drawn are skipped.
+            let color = match SurfaceColor::of(image_buffer) {
+                Ok(color) => color,
+                Err(error) => {
+                    self.log_surface_error(format_args!("{error:#}"));
+                    continue;
+                }
+            };
+
+            let plane_texture = |plane, format| -> Result<_> {
+                let mut texture = ptr::null_mut();
+                let status = unsafe {
+                    CVMetalTextureCache::create_texture_from_image(
+                        None,
+                        &self.core_video_texture_cache,
+                        image_buffer,
+                        None,
+                        format,
+                        CVPixelBufferGetWidthOfPlane(image_buffer, plane),
+                        CVPixelBufferGetHeightOfPlane(image_buffer, plane),
+                        plane,
+                        ptr::NonNull::from(&mut texture),
+                    )
+                };
+                anyhow::ensure!(
+                    status == kCVReturnSuccess,
+                    "failed to create CoreVideo Metal texture for plane {plane}: {status}"
+                );
+                let texture =
+                    ptr::NonNull::new(texture).context("CoreVideo returned a null texture")?;
+                let texture = unsafe { CFRetained::<CVMetalTexture>::from_raw(texture) };
+                let metal_texture = CVMetalTextureGetTexture(&texture)
+                    .context("CoreVideo returned no Metal texture")?;
+                Ok((texture, metal_texture))
+            };
+            let ((y_texture, y_metal_texture), (cb_cr_texture, cb_cr_metal_texture)) = match (
+                plane_texture(0, objc2_metal::MTLPixelFormat::R8Unorm),
+                plane_texture(1, objc2_metal::MTLPixelFormat::RG8Unorm),
+            ) {
+                (Ok(y_texture), Ok(cb_cr_texture)) => (y_texture, cb_cr_texture),
+                (Err(error), _) | (_, Err(error)) => {
+                    self.log_surface_error(format_args!("{error:#}"));
+                    continue;
+                }
+            };
+
             let texture_size = size(
                 DevicePixels::from(CVPixelBufferGetWidth(image_buffer) as i32),
                 DevicePixels::from(CVPixelBufferGetHeight(image_buffer) as i32),
             );
-
-            assert_eq!(
-                CVPixelBufferGetPixelFormatType(image_buffer),
-                kCVPixelFormatType_420YpCbCr8BiPlanarFullRange
-            );
-
-            let plane_texture = |plane, format| unsafe {
-                let mut texture = ptr::null_mut();
-                let status = CVMetalTextureCache::create_texture_from_image(
-                    None,
-                    &self.core_video_texture_cache,
-                    image_buffer,
-                    None,
-                    format,
-                    CVPixelBufferGetWidthOfPlane(image_buffer, plane),
-                    CVPixelBufferGetHeightOfPlane(image_buffer, plane),
-                    plane,
-                    ptr::NonNull::from(&mut texture),
-                );
-                assert_eq!(
-                    status, kCVReturnSuccess,
-                    "failed to create CoreVideo Metal texture"
-                );
-                CFRetained::<CVMetalTexture>::from_raw(
-                    ptr::NonNull::new(texture).expect("CoreVideo returned a null texture"),
-                )
-            };
-            let y_texture = plane_texture(0, objc2_metal::MTLPixelFormat::R8Unorm);
-            let cb_cr_texture = plane_texture(1, objc2_metal::MTLPixelFormat::RG8Unorm);
-
             command_encoder.set_vertex_bytes(
                 SurfaceInputIndex::TextureSize as u64,
                 mem::size_of_val(&texture_size) as u64,
                 &texture_size as *const Size<DevicePixels> as *const _,
             );
             command_encoder.set_fragment_texture(SurfaceInputIndex::YTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(&y_texture)
-                    .expect("CoreVideo returned no Metal texture");
                 Some(metal::TextureRef::from_ptr(
-                    objc2::rc::Retained::as_ptr(&texture) as *mut _,
+                    objc2::rc::Retained::as_ptr(&y_metal_texture) as *mut _,
                 ))
             });
             command_encoder.set_fragment_texture(SurfaceInputIndex::CbCrTexture as u64, unsafe {
-                let texture = CVMetalTextureGetTexture(&cb_cr_texture)
-                    .expect("CoreVideo returned no Metal texture");
                 Some(metal::TextureRef::from_ptr(
-                    objc2::rc::Retained::as_ptr(&texture) as *mut _,
+                    objc2::rc::Retained::as_ptr(&cb_cr_metal_texture) as *mut _,
                 ))
             });
+            let ycbcr_to_rgb = color.ycbcr_to_rgb();
+            command_encoder.set_fragment_bytes(
+                SurfaceInputIndex::YCbCrToRgb as u64,
+                mem::size_of_val(&ycbcr_to_rgb) as u64,
+                &ycbcr_to_rgb as *const [[f32; 4]; 4] as *const _,
+            );
 
             command_encoder.draw_primitives_instanced_base_instance(
                 metal::MTLPrimitiveType::Triangle,
@@ -1305,6 +1357,10 @@ impl MetalRenderer {
                 1,
                 (first_surface + index) as u64,
             );
+
+            // Core Video may recycle the pixel buffer as soon as it and its CVMetalTextures
+            // are released, so keep them until the command buffer that samples them completes.
+            surface_resources.extend([y_texture, cb_cr_texture, image_buffer.clone()]);
         }
     }
 }
@@ -1676,6 +1732,7 @@ enum SurfaceInputIndex {
     TextureSize = 3,
     YTexture = 4,
     CbCrTexture = 5,
+    YCbCrToRgb = 6,
 }
 
 #[repr(C)]
@@ -1733,12 +1790,39 @@ impl gpui::PlatformHeadlessRenderer for MetalHeadlessRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use objc2_core_foundation::{CFDictionary, CFType};
-    use objc2_core_video::{
-        CVPixelBufferCreate, CVPixelBufferGetBaseAddressOfPlane,
-        CVPixelBufferGetBytesPerRowOfPlane, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
-        CVPixelBufferUnlockBaseAddress, kCVPixelBufferIOSurfacePropertiesKey,
+    use crate::surface_color::{
+        SurfaceColor, YCbCrMatrix, YCbCrRange,
+        tests::{decode, encode},
     };
+    use gpui::{Quad, white};
+    use objc2_core_foundation::{CFDictionary, CFNumber, CFString, CFType};
+    use objc2_core_video::{
+        CVAttachmentMode, CVMetalTextureGetTypeID, CVPixelBufferCreate,
+        CVPixelBufferGetBaseAddressOfPlane, CVPixelBufferGetBytesPerRowOfPlane,
+        CVPixelBufferGetTypeID, CVPixelBufferLockBaseAddress, CVPixelBufferLockFlags,
+        CVPixelBufferPool, CVPixelBufferUnlockBaseAddress, kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+        kCVImageBufferYCbCrMatrix_ITU_R_709_2, kCVImageBufferYCbCrMatrix_ITU_R_2020,
+        kCVImageBufferYCbCrMatrixKey, kCVPixelBufferHeightKey,
+        kCVPixelBufferIOSurfacePropertiesKey, kCVPixelBufferPixelFormatTypeKey,
+        kCVPixelBufferPoolAllocationThresholdKey, kCVPixelBufferWidthKey,
+        kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+        kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange, kCVPixelFormatType_422YpCbCr8,
+        kCVReturnWouldExceedAllocationThreshold,
+    };
+    use std::{
+        thread,
+        time::{Duration, Instant},
+    };
+
+    /// How long a test waits for completed command buffers to hand their surfaces back.
+    const RECYCLE_DEADLINE: Duration = Duration::from_secs(10);
+    const RECYCLE_POLL_INTERVAL: Duration = Duration::from_millis(1);
+    /// Surfaces kept in pending frames at once, about what a decoder pool holds in flight.
+    const SURFACES_IN_FLIGHT: usize = 20;
+    /// The plan's per-channel readback tolerance for decoded surfaces, in 8-bit code values.
+    const READBACK_TOLERANCE: u8 = 3;
+    /// A saturated colour that BT.601 and BT.709 decode several code values apart.
+    const READBACK_COLOR: [u8; 3] = [200, 60, 30];
 
     #[test]
     fn render_core_video_surface() {
@@ -1803,6 +1887,679 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+    }
+
+    struct GpuGate(metal::SharedEvent);
+
+    impl GpuGate {
+        fn block(renderer: &MetalRenderer) -> Self {
+            let gate = Self(renderer.device.new_shared_event());
+            let blocker = renderer.command_queue.new_command_buffer();
+            blocker.encode_wait_for_event(&gate.0, 1);
+            blocker.commit();
+            gate
+        }
+
+        fn release(&self) {
+            self.0.set_signaled_value(1);
+        }
+    }
+
+    impl Drop for GpuGate {
+        fn drop(&mut self) {
+            self.release();
+        }
+    }
+
+    fn pixel_buffer_pool() -> CFRetained<CVPixelBufferPool> {
+        let pixel_format = CFNumber::new_i32(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange as i32);
+        let dimension = CFNumber::new_i32(16);
+        let io_surface_properties = CFDictionary::<CFType, CFType>::empty();
+        let keys = unsafe {
+            [
+                kCVPixelBufferPixelFormatTypeKey,
+                kCVPixelBufferWidthKey,
+                kCVPixelBufferHeightKey,
+                kCVPixelBufferIOSurfacePropertiesKey,
+            ]
+        };
+        let pixel_buffer_attributes = CFDictionary::<CFString, CFType>::from_slices(
+            &keys,
+            &[
+                &pixel_format,
+                &dimension,
+                &dimension,
+                &io_surface_properties,
+            ],
+        );
+        let mut pool = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                CVPixelBufferPool::create(
+                    None,
+                    None,
+                    Some(pixel_buffer_attributes.as_opaque()),
+                    ptr::NonNull::from(&mut pool),
+                )
+            },
+            kCVReturnSuccess
+        );
+        unsafe { CFRetained::from_raw(ptr::NonNull::new(pool).unwrap()) }
+    }
+
+    /// Asks the pool for a buffer while it has at most `threshold` buffers allocated.
+    fn pooled_pixel_buffer(
+        pool: &CVPixelBufferPool,
+        threshold: usize,
+    ) -> (i32, Option<CFRetained<CVImageBuffer>>) {
+        let threshold = CFNumber::new_i32(i32::try_from(threshold).unwrap());
+        let attributes = CFDictionary::<CFString, CFType>::from_slices(
+            &[unsafe { kCVPixelBufferPoolAllocationThresholdKey }],
+            &[&threshold],
+        );
+        let mut image_buffer = ptr::null_mut();
+        let status = unsafe {
+            CVPixelBufferPool::create_pixel_buffer_with_aux_attributes(
+                None,
+                pool,
+                Some(attributes.as_opaque()),
+                ptr::NonNull::from(&mut image_buffer),
+            )
+        };
+        let image_buffer = ptr::NonNull::new(image_buffer)
+            .map(|image_buffer| unsafe { CFRetained::from_raw(image_buffer) });
+        (status, image_buffer)
+    }
+
+    /// Waits until the pool can hand out all `count` buffers it allocated again.
+    fn assert_pixel_buffers_are_recycled(
+        pool: &CVPixelBufferPool,
+        count: usize,
+        cache: Option<&CVMetalTextureCache>,
+    ) {
+        let deadline = Instant::now() + RECYCLE_DEADLINE;
+        let mut recycled = Vec::with_capacity(count);
+        while recycled.len() < count {
+            match pooled_pixel_buffer(pool, count) {
+                (status, Some(image_buffer)) if status == kCVReturnSuccess => {
+                    recycled.push(image_buffer)
+                }
+                _ => {
+                    assert!(
+                        Instant::now() < deadline,
+                        "only {} of {count} pixel buffers were released after the command buffers completed",
+                        recycled.len()
+                    );
+                    if let Some(cache) = cache {
+                        cache.flush(0);
+                    }
+                    thread::sleep(RECYCLE_POLL_INTERVAL);
+                }
+            }
+        }
+    }
+
+    fn surface_scene(image_buffer: CFRetained<CVImageBuffer>) -> Scene {
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(PaintSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            image_buffer,
+        });
+        scene.finish();
+        scene
+    }
+
+    #[test]
+    fn surface_is_not_recycled_while_the_gpu_reads_it() {
+        objc2::rc::autoreleasepool(|_| {
+            let pool = pixel_buffer_pool();
+            let (status, image_buffer) = pooled_pixel_buffer(&pool, 1);
+            assert_eq!(status, kCVReturnSuccess);
+            let scene = surface_scene(image_buffer.unwrap());
+            let mut renderer =
+                MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+            let gate = GpuGate::block(&renderer);
+            let viewport_size = size(DevicePixels(16), DevicePixels(16));
+            let descriptor = metal::TextureDescriptor::new();
+            descriptor.set_width(16);
+            descriptor.set_height(16);
+            descriptor.set_pixel_format(MTLPixelFormat::BGRA8Unorm);
+            descriptor.set_usage(metal::MTLTextureUsage::RenderTarget);
+            let target = renderer.device.new_texture(&descriptor);
+            let mut writer = InstanceBufferWriter::new(
+                &renderer.device,
+                &renderer.instance_buffer_pool,
+                renderer.is_unified_memory,
+            );
+            let bindings = write_instances(&scene, &mut writer).unwrap();
+            let mut surface_resources = Vec::new();
+            let command_buffer = renderer
+                .draw_primitives_to_texture(
+                    &scene,
+                    &bindings,
+                    &mut writer,
+                    &target,
+                    viewport_size,
+                    &mut surface_resources,
+                )
+                .unwrap();
+            drop(scene);
+
+            // Observe the exact Core Video objects encoded by the draw. A second cache lookup
+            // may return different wrappers, and the pool check alone passes with either owner retained.
+            let observed_resources = surface_resources.clone();
+            assert_eq!(observed_resources.len(), 3);
+            let expected_types = [
+                CVMetalTextureGetTypeID(),
+                CVMetalTextureGetTypeID(),
+                CVPixelBufferGetTypeID(),
+            ];
+            let retain_counts: Vec<_> = observed_resources
+                .iter()
+                .zip(expected_types)
+                .map(|(resource, expected_type)| {
+                    let resource = AsRef::<CFType>::as_ref(&**resource);
+                    assert_eq!(
+                        objc2_core_foundation::CFGetTypeID(Some(resource)),
+                        expected_type
+                    );
+                    resource.retain_count()
+                })
+                .collect();
+            renderer.retain_frame_resources(&command_buffer, writer.finish(), surface_resources);
+            command_buffer.commit();
+            for ((resource, retain_count), name) in observed_resources
+                .iter()
+                .zip(retain_counts)
+                .zip(["Y texture", "CbCr texture", "pixel buffer"])
+            {
+                assert_eq!(
+                    AsRef::<CFType>::as_ref(&**resource).retain_count(),
+                    retain_count,
+                    "the completed handler must retain the {name} independently"
+                );
+            }
+            // The observers must not protect the allocation during the pool assertion.
+            drop(observed_resources);
+            renderer.core_video_texture_cache.flush(0);
+            assert_eq!(
+                pooled_pixel_buffer(&pool, 1).0,
+                kCVReturnWouldExceedAllocationThreshold,
+                "the pool recycled a pixel buffer that a pending command buffer still samples"
+            );
+            gate.release();
+            assert_pixel_buffers_are_recycled(&pool, 1, Some(&renderer.core_video_texture_cache));
+        });
+    }
+
+    #[test]
+    fn dropping_renderer_releases_surface_after_gpu_completion() {
+        objc2::rc::autoreleasepool(|_| {
+            let pool = pixel_buffer_pool();
+            let (status, image_buffer) = pooled_pixel_buffer(&pool, 1);
+            assert_eq!(status, kCVReturnSuccess);
+            let scene = surface_scene(image_buffer.unwrap());
+            let mut renderer =
+                MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+            let gate = GpuGate::block(&renderer);
+            renderer
+                .render_scene(&scene, size(DevicePixels(16), DevicePixels(16)))
+                .unwrap();
+            drop(scene);
+            renderer.core_video_texture_cache.flush(0);
+            let completed = renderer.command_queue.new_command_buffer().to_owned();
+            completed.commit();
+            drop(renderer);
+            assert_eq!(
+                pooled_pixel_buffer(&pool, 1).0,
+                kCVReturnWouldExceedAllocationThreshold
+            );
+            gate.release();
+            completed.wait_until_completed();
+            assert_eq!(completed.status(), metal::MTLCommandBufferStatus::Completed);
+            assert_pixel_buffers_are_recycled(&pool, 1, None);
+        });
+    }
+
+    #[test]
+    fn gpu_gate_is_released_when_assertions_unwind() {
+        objc2::rc::autoreleasepool(|_| {
+            let renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+            let gate = GpuGate::block(&renderer);
+            let event = gate.0.clone();
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                let _gate = gate;
+                panic!("exercise the GPU gate's unwind cleanup");
+            }));
+            assert!(result.is_err());
+            assert_eq!(event.signaled_value(), 1);
+        });
+    }
+
+    #[test]
+    fn surfaces_that_cannot_be_sampled_are_skipped() {
+        let io_surface_properties = CFDictionary::<CFType, CFType>::empty();
+        let io_surface_backed = CFDictionary::from_slices(
+            &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+            &[&*io_surface_properties],
+        );
+        let pixel_buffer = |pixel_format, attributes: Option<&CFDictionary>| {
+            let mut image_buffer = ptr::null_mut();
+            assert_eq!(
+                unsafe {
+                    CVPixelBufferCreate(
+                        None,
+                        16,
+                        16,
+                        pixel_format,
+                        attributes,
+                        ptr::NonNull::from(&mut image_buffer),
+                    )
+                },
+                kCVReturnSuccess
+            );
+            unsafe { CFRetained::from_raw(ptr::NonNull::new(image_buffer).unwrap()) }
+        };
+
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        for image_buffer in [
+            pixel_buffer(
+                kCVPixelFormatType_422YpCbCr8,
+                Some(io_surface_backed.as_opaque()),
+            ),
+            // Without an IOSurface, Core Video can't map the planes into Metal.
+            pixel_buffer(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, None),
+        ] {
+            let bounds = Bounds {
+                origin: Point::default(),
+                size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+            };
+            let mut scene = Scene::default();
+            scene.insert_primitive(PaintSurface {
+                order: 0,
+                bounds,
+                content_mask: ContentMask { bounds },
+                image_buffer,
+            });
+            scene.insert_primitive(Quad {
+                order: 1,
+                bounds,
+                content_mask: ContentMask { bounds },
+                background: white().into(),
+                ..Default::default()
+            });
+            scene.finish();
+
+            let image = renderer
+                .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+                .unwrap();
+            assert!(
+                image
+                    .pixels()
+                    .all(|image::Rgba(pixel)| *pixel == [255, 255, 255, 255])
+            );
+        }
+    }
+
+    fn surface_pixel_buffer(
+        pixel_format: u32,
+        iosurface_backed: bool,
+        luma: u8,
+    ) -> CFRetained<objc2_core_video::CVPixelBuffer> {
+        ycbcr_pixel_buffer(pixel_format, iosurface_backed, [luma, 128, 128])
+    }
+
+    /// A 16x16 buffer whose bi-planar 4:2:0 planes, if it has them, hold one `[y, cb, cr]` sample.
+    fn ycbcr_pixel_buffer(
+        pixel_format: u32,
+        iosurface_backed: bool,
+        [luma, cb, cr]: [u8; 3],
+    ) -> CFRetained<objc2_core_video::CVPixelBuffer> {
+        let properties = CFDictionary::<CFType, CFType>::empty();
+        let attributes = CFDictionary::from_slices(
+            &[unsafe { kCVPixelBufferIOSurfacePropertiesKey }],
+            &[&*properties],
+        );
+        let mut buffer = ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                CVPixelBufferCreate(
+                    None,
+                    16,
+                    16,
+                    pixel_format,
+                    iosurface_backed.then_some(attributes.as_opaque()),
+                    ptr::NonNull::from(&mut buffer),
+                )
+            },
+            kCVReturnSuccess
+        );
+        let buffer = unsafe { CFRetained::from_raw(ptr::NonNull::new(buffer).unwrap()) };
+        if [
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange,
+        ]
+        .contains(&pixel_format)
+        {
+            unsafe {
+                assert_eq!(
+                    CVPixelBufferLockBaseAddress(&buffer, CVPixelBufferLockFlags::empty()),
+                    kCVReturnSuccess
+                );
+                for plane in 0..2 {
+                    let bytes = CVPixelBufferGetBaseAddressOfPlane(&buffer, plane).cast::<u8>();
+                    let length = CVPixelBufferGetBytesPerRowOfPlane(&buffer, plane)
+                        * CVPixelBufferGetHeightOfPlane(&buffer, plane);
+                    let samples = slice::from_raw_parts_mut(bytes, length);
+                    if plane == 0 {
+                        samples.fill(luma);
+                    } else {
+                        for chroma in samples.chunks_exact_mut(2) {
+                            chroma.copy_from_slice(&[cb, cr]);
+                        }
+                    }
+                }
+                assert_eq!(
+                    CVPixelBufferUnlockBaseAddress(&buffer, CVPixelBufferLockFlags::empty()),
+                    kCVReturnSuccess
+                );
+            }
+        }
+        buffer
+    }
+
+    #[test]
+    fn mixed_surface_batch_preserves_indices_and_clip() {
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let mut scene = Scene::default();
+        for (index, buffer) in [
+            surface_pixel_buffer(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, true, 80),
+            surface_pixel_buffer(kCVPixelFormatType_422YpCbCr8, true, 0),
+            surface_pixel_buffer(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, false, 0),
+            surface_pixel_buffer(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, true, 200),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let bounds = Bounds {
+                origin: point(ScaledPixels(index as f32 * 16.0), ScaledPixels(0.0)),
+                size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+            };
+            let mut mask = bounds;
+            if index == 0 {
+                mask.size.width = ScaledPixels(8.0);
+            }
+            scene.insert_primitive(PaintSurface {
+                order: index as u32,
+                bounds,
+                content_mask: ContentMask { bounds: mask },
+                image_buffer: buffer,
+            });
+        }
+        let bounds = Bounds {
+            origin: point(ScaledPixels(16.0), ScaledPixels(0.0)),
+            size: size(ScaledPixels(8.0), ScaledPixels(16.0)),
+        };
+        scene.insert_primitive(Quad {
+            order: 4,
+            bounds,
+            content_mask: ContentMask { bounds },
+            background: white().into(),
+            ..Default::default()
+        });
+        scene.finish();
+        assert!(
+            matches!(scene.batches().next(), Some(PrimitiveBatch::Surfaces(range)) if range == (0..4))
+        );
+        let image = renderer
+            .render_scene_to_image(&scene, size(DevicePixels(64), DevicePixels(16)))
+            .unwrap();
+        for (x, y, image::Rgba([red, green, blue, alpha])) in image.enumerate_pixels() {
+            let expected = match x {
+                0..=7 => 80,
+                16..=23 => 255,
+                48..=63 => 200,
+                _ => 0,
+            };
+            assert!(
+                red.abs_diff(expected) <= 2
+                    && green.abs_diff(expected) <= 2
+                    && blue.abs_diff(expected) <= 2
+                    && *alpha == 255,
+                "wrong pixel ({x},{y}): {red},{green},{blue},{alpha}; expected {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn surface_errors_are_logged_once_per_renderer() {
+        use std::sync::{
+            OnceLock,
+            atomic::{AtomicUsize, Ordering},
+        };
+
+        struct ErrorLogger {
+            thread: thread::ThreadId,
+            count: AtomicUsize,
+        }
+
+        impl log::Log for ErrorLogger {
+            fn enabled(&self, metadata: &log::Metadata<'_>) -> bool {
+                metadata.level() == log::Level::Error
+            }
+
+            fn log(&self, record: &log::Record<'_>) {
+                if thread::current().id() == self.thread
+                    && record.args().to_string().starts_with("skipping surface:")
+                {
+                    self.count.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+
+            fn flush(&self) {}
+        }
+
+        static LOGGER: OnceLock<ErrorLogger> = OnceLock::new();
+        let logger = LOGGER.get_or_init(|| ErrorLogger {
+            thread: thread::current().id(),
+            count: AtomicUsize::new(0),
+        });
+        log::set_logger(logger).unwrap();
+        log::set_max_level(log::LevelFilter::Error);
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        for image_buffer in [
+            surface_pixel_buffer(kCVPixelFormatType_422YpCbCr8, true, 0),
+            surface_pixel_buffer(kCVPixelFormatType_420YpCbCr8BiPlanarFullRange, false, 0),
+        ] {
+            let scene = surface_scene(image_buffer);
+            for _ in 0..120 {
+                renderer
+                    .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+                    .unwrap();
+            }
+        }
+        assert_eq!(logger.count.load(Ordering::Relaxed), 1);
+        assert_eq!(renderer.suppressed_surface_errors, Some(239));
+
+        let mut another_renderer =
+            MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let scene = surface_scene(surface_pixel_buffer(kCVPixelFormatType_422YpCbCr8, true, 0));
+        another_renderer
+            .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+            .unwrap();
+        assert_eq!(logger.count.load(Ordering::Relaxed), 2);
+        assert_eq!(another_renderer.suppressed_surface_errors, Some(0));
+    }
+
+    fn tag_ycbcr_matrix(image_buffer: &CVImageBuffer, matrix: &CFString) {
+        unsafe {
+            image_buffer.set_attachment(
+                kCVImageBufferYCbCrMatrixKey,
+                matrix.as_ref(),
+                CVAttachmentMode::ShouldPropagate,
+            );
+        }
+    }
+
+    fn differs_beyond_tolerance(decoded: [f32; 3], expected: [u8; 3]) -> bool {
+        decoded.iter().zip(expected).any(|(decoded, expected)| {
+            (decoded - f32::from(expected)).abs() > f32::from(READBACK_TOLERANCE)
+        })
+    }
+
+    #[test]
+    fn surface_readback_follows_the_range_and_matrix_attachment() {
+        let video = kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange;
+        let full = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+        let (bt601, bt709) = unsafe {
+            (
+                kCVImageBufferYCbCrMatrix_ITU_R_601_4,
+                kCVImageBufferYCbCrMatrix_ITU_R_709_2,
+            )
+        };
+        let color = |matrix, range| SurfaceColor { matrix, range };
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        for (pixel_format, matrix_attachment, color) in [
+            (
+                video,
+                Some(bt709),
+                color(YCbCrMatrix::Bt709, YCbCrRange::Video),
+            ),
+            (
+                full,
+                Some(bt709),
+                color(YCbCrMatrix::Bt709, YCbCrRange::Full),
+            ),
+            (
+                video,
+                Some(bt601),
+                color(YCbCrMatrix::Bt601, YCbCrRange::Video),
+            ),
+            (
+                full,
+                Some(bt601),
+                color(YCbCrMatrix::Bt601, YCbCrRange::Full),
+            ),
+            (video, None, color(YCbCrMatrix::Bt601, YCbCrRange::Video)),
+            (full, None, color(YCbCrMatrix::Bt601, YCbCrRange::Full)),
+        ] {
+            let codes = encode(color, READBACK_COLOR);
+            let other_matrix = match color.matrix {
+                YCbCrMatrix::Bt601 => YCbCrMatrix::Bt709,
+                YCbCrMatrix::Bt709 => YCbCrMatrix::Bt601,
+            };
+            let other_range = match color.range {
+                YCbCrRange::Video => YCbCrRange::Full,
+                YCbCrRange::Full => YCbCrRange::Video,
+            };
+            for misread in [
+                SurfaceColor {
+                    matrix: other_matrix,
+                    ..color
+                },
+                SurfaceColor {
+                    range: other_range,
+                    ..color
+                },
+            ] {
+                assert!(
+                    differs_beyond_tolerance(decode(misread, codes), READBACK_COLOR),
+                    "{READBACK_COLOR:?} cannot tell {color:?} from {misread:?}"
+                );
+            }
+
+            let image_buffer = ycbcr_pixel_buffer(pixel_format, true, codes);
+            if let Some(matrix) = matrix_attachment {
+                tag_ycbcr_matrix(&image_buffer, matrix);
+            }
+            let image = renderer
+                .render_scene_to_image(
+                    &surface_scene(image_buffer),
+                    size(DevicePixels(16), DevicePixels(16)),
+                )
+                .unwrap();
+            for image::Rgba([red, green, blue, alpha]) in image.pixels() {
+                assert!(
+                    !differs_beyond_tolerance([*red, *green, *blue].map(f32::from), READBACK_COLOR)
+                        && *alpha == 255,
+                    "{color:?} codes {codes:?} read back {red},{green},{blue},{alpha}; expected {READBACK_COLOR:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn surfaces_with_an_unsupported_matrix_are_skipped() {
+        let image_buffer = ycbcr_pixel_buffer(
+            kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
+            true,
+            [200, 90, 160],
+        );
+        tag_ycbcr_matrix(&image_buffer, unsafe {
+            kCVImageBufferYCbCrMatrix_ITU_R_2020
+        });
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        let image = renderer
+            .render_scene_to_image(
+                &surface_scene(image_buffer),
+                size(DevicePixels(16), DevicePixels(16)),
+            )
+            .unwrap();
+        assert!(
+            image
+                .pixels()
+                .all(|image::Rgba(pixel)| *pixel == [0, 0, 0, 255])
+        );
+        assert_eq!(renderer.suppressed_surface_errors, Some(0));
+    }
+
+    #[test]
+    fn pool_hands_out_none_of_20_surfaces_held_by_pending_frames() {
+        objc2::rc::autoreleasepool(|_| {
+            let pool = pixel_buffer_pool();
+            let mut renderer =
+                MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+            let gate = GpuGate::block(&renderer);
+            let viewport_size = size(DevicePixels(16), DevicePixels(16));
+            let mut in_flight = Vec::with_capacity(SURFACES_IN_FLIGHT);
+            for _ in 0..SURFACES_IN_FLIGHT {
+                let (status, image_buffer) = pooled_pixel_buffer(&pool, SURFACES_IN_FLIGHT);
+                assert_eq!(status, kCVReturnSuccess);
+                let image_buffer = image_buffer.unwrap();
+                in_flight.push(CFRetained::as_ptr(&image_buffer));
+                renderer
+                    .render_scene(&surface_scene(image_buffer), viewport_size)
+                    .unwrap();
+            }
+            renderer.core_video_texture_cache.flush(0);
+
+            let handed_out: Vec<_> = (0..SURFACES_IN_FLIGHT)
+                .filter_map(|_| pooled_pixel_buffer(&pool, SURFACES_IN_FLIGHT).1)
+                .collect();
+            let still_sampled = handed_out
+                .iter()
+                .filter(|image_buffer| in_flight.contains(&CFRetained::as_ptr(image_buffer)))
+                .count();
+            assert!(
+                handed_out.is_empty(),
+                "the pool handed out {}/{SURFACES_IN_FLIGHT} surfaces while pending frames held them, \
+                 {still_sampled} of them still sampled by a pending frame",
+                handed_out.len()
+            );
+
+            gate.release();
+            assert_pixel_buffers_are_recycled(
+                &pool,
+                SURFACES_IN_FLIGHT,
+                Some(&renderer.core_video_texture_cache),
+            );
+        });
     }
 
     #[test]

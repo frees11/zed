@@ -9,6 +9,7 @@ mod dispatcher;
 pub mod keychain;
 mod metal_atlas;
 pub mod metal_renderer;
+mod surface_color;
 pub mod thermal;
 
 #[cfg(feature = "font-kit")]
