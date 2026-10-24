@@ -21,7 +21,10 @@ use windows::{
 
 use crate::directx_renderer::shader_resources::{RawShaderBytes, ShaderModule, ShaderTarget};
 use crate::*;
+use external_surfaces::ExternalSurfaces;
 use gpui::*;
+
+mod external_surfaces;
 
 pub(crate) const DISABLE_DIRECT_COMPOSITION: &str = "GPUI_DISABLE_DIRECT_COMPOSITION";
 const RENDER_TARGET_FORMAT: DXGI_FORMAT = DXGI_FORMAT_B8G8R8A8_UNORM;
@@ -54,7 +57,7 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
-    unsupported_external_surfaces: UnsupportedExternalSurfaces,
+    external_surfaces: Option<ExternalSurfaces>,
 }
 
 /// Direct3D objects
@@ -171,6 +174,8 @@ impl DirectXRenderer {
             .context("Creating DirectX global elements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectX render pipelines")?;
+        let external_surfaces =
+            ExternalSurfaces::new(&devices.device).context("Creating DirectX external surfaces")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -195,7 +200,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
-            unsupported_external_surfaces: UnsupportedExternalSurfaces::default(),
+            external_surfaces: Some(external_surfaces),
         })
     }
 
@@ -274,6 +279,7 @@ impl DirectXRenderer {
             }
 
             self.resources.take();
+            self.external_surfaces.take();
             if let Some(devices) = &self.devices {
                 devices.device_context.OMSetRenderTargets(None, None);
                 devices.device_context.ClearState();
@@ -302,6 +308,8 @@ impl DirectXRenderer {
             .context("Creating DirectXGlobalElements")?;
         let pipelines = DirectXRenderPipelines::new(&devices.device)
             .context("Creating DirectXRenderPipelines")?;
+        let external_surfaces =
+            ExternalSurfaces::new(&devices.device).context("Creating DirectX external surfaces")?;
 
         let direct_composition = if disable_direct_composition {
             None
@@ -324,6 +332,7 @@ impl DirectXRenderer {
         self.resources = Some(resources);
         self.globals = globals;
         self.pipelines = pipelines;
+        self.external_surfaces = Some(external_surfaces);
         self.direct_composition = direct_composition;
         self.skip_draws = true;
         Ok(())
@@ -388,9 +397,7 @@ impl DirectXRenderer {
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
                 PrimitiveBatch::ExternalSurfaces(range) => {
-                    self.unsupported_external_surfaces
-                        .skip_all("DirectX", &scene.external_surfaces[range]);
-                    Ok(())
+                    self.draw_external_surfaces(&scene.external_surfaces[range])
                 }
             }
             .with_context(|| {
@@ -408,6 +415,10 @@ impl DirectXRenderer {
                 )
             })?;
         }
+        self.external_surfaces
+            .as_mut()
+            .context("external surfaces missing")?
+            .finish_frame();
         Ok(())
     }
 
@@ -432,61 +443,12 @@ impl DirectXRenderer {
         self.render(scene, background_appearance)?;
 
         let devices = self.devices.as_ref().context("devices missing")?;
-        let device = &devices.device;
-        let context = &devices.device_context;
         let resources = self.resources.as_ref().context("resources missing")?;
         let render_target = resources
             .render_target
             .as_ref()
             .context("render target missing")?;
-
-        // A CPU-readable copy of the render target.
-        let mut desc = D3D11_TEXTURE2D_DESC::default();
-        unsafe { render_target.GetDesc(&mut desc) };
-        let width = desc.Width;
-        let height = desc.Height;
-        let staging_desc = D3D11_TEXTURE2D_DESC {
-            Usage: D3D11_USAGE_STAGING,
-            BindFlags: 0,
-            CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
-            MiscFlags: 0,
-            MipLevels: 1,
-            ArraySize: 1,
-            SampleDesc: DXGI_SAMPLE_DESC {
-                Count: 1,
-                Quality: 0,
-            },
-            ..desc
-        };
-        let mut staging: Option<ID3D11Texture2D> = None;
-        unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging))? };
-        let staging = staging.context("creating staging texture")?;
-        unsafe { context.CopyResource(&staging, render_target) };
-
-        let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
-        unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
-        let row_bytes = (width as usize) * 4;
-        let mut pixels = vec![0u8; row_bytes * height as usize];
-        // SAFETY: `Map` succeeded, so `pData` points at `RowPitch * height`
-        // readable bytes for as long as the mapping is held, and `RowPitch >=
-        // row_bytes` (it only ever adds trailing padding). `pixels` is sized
-        // `row_bytes * height`, so every copy stays in bounds on both sides,
-        // and the regions cannot overlap (`pixels` is a fresh allocation).
-        unsafe {
-            let src = mapped.pData as *const u8;
-            for row in 0..height as usize {
-                let s = src.add(row * mapped.RowPitch as usize);
-                let d = pixels.as_mut_ptr().add(row * row_bytes);
-                std::ptr::copy_nonoverlapping(s, d, row_bytes);
-            }
-            context.Unmap(&staging, 0);
-        }
-        // The render target is BGRA; image::RgbaImage expects RGBA.
-        for px in pixels.chunks_exact_mut(4) {
-            px.swap(0, 2);
-        }
-        image::RgbaImage::from_raw(width, height, pixels)
-            .context("Failed to build RgbaImage from staging readback")
+        read_back_render_target(&devices.device, &devices.device_context, render_target)
     }
 
     pub(crate) fn resize(&mut self, new_size: Size<DevicePixels>) -> Result<()> {
@@ -820,6 +782,14 @@ impl DirectXRenderer {
         )
     }
 
+    fn draw_external_surfaces(&mut self, surfaces: &[PaintExternalSurface]) -> Result<()> {
+        let devices = self.devices.as_ref().context("devices missing")?;
+        self.external_surfaces
+            .as_mut()
+            .context("external surfaces missing")?
+            .draw(&devices.device_context, surfaces)
+    }
+
     fn draw_surfaces(&mut self, surfaces: &[PaintSurface]) -> Result<()> {
         if surfaces.is_empty() {
             return Ok(());
@@ -875,6 +845,62 @@ impl DirectXRenderer {
     pub(crate) fn mark_drawable(&mut self) {
         self.skip_draws = false;
     }
+}
+
+/// Copies a B8G8R8A8 render target into a CPU image, converting it to RGBA.
+#[cfg(any(test, feature = "test-support"))]
+fn read_back_render_target(
+    device: &ID3D11Device,
+    context: &ID3D11DeviceContext,
+    render_target: &ID3D11Texture2D,
+) -> Result<image::RgbaImage> {
+    // A CPU-readable copy of the render target.
+    let mut desc = D3D11_TEXTURE2D_DESC::default();
+    unsafe { render_target.GetDesc(&mut desc) };
+    let width = desc.Width;
+    let height = desc.Height;
+    let staging_desc = D3D11_TEXTURE2D_DESC {
+        Usage: D3D11_USAGE_STAGING,
+        BindFlags: 0,
+        CPUAccessFlags: D3D11_CPU_ACCESS_READ.0 as u32,
+        MiscFlags: 0,
+        MipLevels: 1,
+        ArraySize: 1,
+        SampleDesc: DXGI_SAMPLE_DESC {
+            Count: 1,
+            Quality: 0,
+        },
+        ..desc
+    };
+    let mut staging: Option<ID3D11Texture2D> = None;
+    unsafe { device.CreateTexture2D(&staging_desc, None, Some(&mut staging))? };
+    let staging = staging.context("creating staging texture")?;
+    unsafe { context.CopyResource(&staging, render_target) };
+
+    let mut mapped = D3D11_MAPPED_SUBRESOURCE::default();
+    unsafe { context.Map(&staging, 0, D3D11_MAP_READ, 0, Some(&mut mapped))? };
+    let row_bytes = (width as usize) * 4;
+    let mut pixels = vec![0u8; row_bytes * height as usize];
+    // SAFETY: `Map` succeeded, so `pData` points at `RowPitch * height`
+    // readable bytes for as long as the mapping is held, and `RowPitch >=
+    // row_bytes` (it only ever adds trailing padding). `pixels` is sized
+    // `row_bytes * height`, so every copy stays in bounds on both sides,
+    // and the regions cannot overlap (`pixels` is a fresh allocation).
+    unsafe {
+        let src = mapped.pData as *const u8;
+        for row in 0..height as usize {
+            let s = src.add(row * mapped.RowPitch as usize);
+            let d = pixels.as_mut_ptr().add(row * row_bytes);
+            std::ptr::copy_nonoverlapping(s, d, row_bytes);
+        }
+        context.Unmap(&staging, 0);
+    }
+    // The render target is BGRA; image::RgbaImage expects RGBA.
+    for px in pixels.chunks_exact_mut(4) {
+        px.swap(0, 2);
+    }
+    image::RgbaImage::from_raw(width, height, pixels)
+        .context("Failed to build RgbaImage from staging readback")
 }
 
 impl DirectXResources {
@@ -1727,6 +1753,7 @@ pub(crate) mod shader_resources {
         SubpixelSprite,
         PolychromeSprite,
         EmojiRasterization,
+        Nv12Surface,
     }
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1803,6 +1830,10 @@ pub(crate) mod shader_resources {
                 ShaderModule::EmojiRasterization => match target {
                     ShaderTarget::Vertex => EMOJI_RASTERIZATION_VERTEX_BYTES,
                     ShaderTarget::Fragment => EMOJI_RASTERIZATION_FRAGMENT_BYTES,
+                },
+                ShaderModule::Nv12Surface => match target {
+                    ShaderTarget::Vertex => NV12_SURFACE_VERTEX_BYTES,
+                    ShaderTarget::Fragment => NV12_SURFACE_FRAGMENT_BYTES,
                 },
             };
             Self { inner: bytes }
@@ -1905,6 +1936,7 @@ pub(crate) mod shader_resources {
                 ShaderModule::SubpixelSprite => "subpixel_sprite",
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
+                ShaderModule::Nv12Surface => "nv12_surface",
             }
         }
     }
@@ -1917,7 +1949,7 @@ pub(crate) mod shader_resources {
 
         const DXBC_MAGIC: &[u8] = b"DXBC";
 
-        const ALL_MODULES: [ShaderModule; 9] = [
+        const ALL_MODULES: [ShaderModule; 10] = [
             ShaderModule::Quad,
             ShaderModule::Shadow,
             ShaderModule::Underline,
@@ -1927,6 +1959,7 @@ pub(crate) mod shader_resources {
             ShaderModule::SubpixelSprite,
             ShaderModule::PolychromeSprite,
             ShaderModule::EmojiRasterization,
+            ShaderModule::Nv12Surface,
         ];
 
         #[cfg(not(gpui_windows_precompiled_shaders))]

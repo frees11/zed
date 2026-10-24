@@ -1266,3 +1266,46 @@ float4 polychrome_sprite_fragment(PolychromeSpriteFragmentInput input): SV_Targe
     color.a *= sprite.opacity * saturate(0.5 - distance);
     return color;
 }
+
+/// External NV12 surfaces: the renderer's copy of a frame shared by another Direct3D 11 device,
+/// luma in t2 (R8), interleaved Cb/Cr in t3 (R8G8), turned into RGB by the frame's colour matrix.
+/// The matrix arrives column-major, the layout gpui's `YuvColorMatrix::ycbcr_to_rgb` produces.
+
+cbuffer Nv12SurfaceParams: register(b2) {
+    Bounds nv12_bounds;
+    Bounds nv12_content_mask;
+    float2 nv12_uv_scale;
+    float2 nv12_pad;
+    column_major float4x4 nv12_ycbcr_to_rgb;
+};
+
+Texture2D<float> t_nv12_luma: register(t2);
+Texture2D<float2> t_nv12_chroma: register(t3);
+SamplerState s_nv12: register(s1);
+
+struct Nv12SurfaceVertexOutput {
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD0;
+    float4 clip_distance: SV_ClipDistance;
+};
+
+struct Nv12SurfaceFragmentInput {
+    float4 position: SV_Position;
+    float2 texture_coords: TEXCOORD0;
+};
+
+Nv12SurfaceVertexOutput nv12_surface_vertex(uint vertex_id: SV_VertexID) {
+    float2 unit_vertex = float2(float(vertex_id & 1u), 0.5 * float(vertex_id & 2u));
+
+    Nv12SurfaceVertexOutput output;
+    output.position = to_device_position(unit_vertex, nv12_bounds);
+    output.texture_coords = unit_vertex * nv12_uv_scale;
+    output.clip_distance = distance_from_clip_rect(unit_vertex, nv12_bounds, nv12_content_mask);
+    return output;
+}
+
+float4 nv12_surface_fragment(Nv12SurfaceFragmentInput input): SV_Target {
+    float luma = t_nv12_luma.Sample(s_nv12, input.texture_coords);
+    float2 chroma = t_nv12_chroma.Sample(s_nv12, input.texture_coords);
+    return mul(nv12_ycbcr_to_rgb, float4(luma, chroma, 1.0));
+}
