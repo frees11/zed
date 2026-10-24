@@ -12,6 +12,7 @@
 use super::events::*;
 use super::text_input::TextInputView;
 use super::{CallbackSlot, IosDisplay, platform::IosPlatformState};
+use crate::keyboard::{HardwareKeyboard, KeyTransition};
 use gpui::{
     AnyWindowHandle, BackGestureEvent, BackGesturePhase, Bounds, Capslock, Corners, DevicePixels,
     DispatchEventResult, DisplayId, Edges, GpuSpecs, Modifiers, Pixels, PlatformAtlas,
@@ -45,6 +46,7 @@ use objc2_ui_kit::{
     UITraitEnvironment, UIUserInterfaceLayoutDirection, UIUserInterfaceStyle, UIView,
     UIViewAutoresizing, UIViewController, UIWindow, UIWindowScene,
 };
+use objc2_ui_kit::{UIPress, UIPressesEvent};
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle, UiKitDisplayHandle, UiKitWindowHandle};
 use std::{
@@ -187,6 +189,38 @@ define_class!(
             self.handle_touches(touches, event);
         }
 
+        #[unsafe(method(canBecomeFirstResponder))]
+        fn can_become_first_responder(&self) -> bool {
+            true
+        }
+
+        #[unsafe(method(pressesBegan:withEvent:))]
+        fn presses_began(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            if let Some(unhandled) = self.unhandled_presses(presses, KeyTransition::Down) {
+                unsafe {
+                    let _: () = msg_send![super(self), pressesBegan: &*unhandled, withEvent: event];
+                }
+            }
+        }
+
+        #[unsafe(method(pressesEnded:withEvent:))]
+        fn presses_ended(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            if let Some(unhandled) = self.unhandled_presses(presses, KeyTransition::Up) {
+                unsafe {
+                    let _: () = msg_send![super(self), pressesEnded: &*unhandled, withEvent: event];
+                }
+            }
+        }
+
+        #[unsafe(method(pressesCancelled:withEvent:))]
+        fn presses_cancelled(&self, presses: &NSSet<UIPress>, event: Option<&UIPressesEvent>) {
+            if let Some(unhandled) = self.unhandled_presses(presses, KeyTransition::Up) {
+                unsafe {
+                    let _: () = msg_send![super(self), pressesCancelled: &*unhandled, withEvent: event];
+                }
+            }
+        }
+
         #[unsafe(method(handleScroll:))]
         fn handle_scroll(&self, recognizer: &UIPanGestureRecognizer) {
             self.ivars()
@@ -222,6 +256,25 @@ impl MetalView {
             self.ivars()
                 .with_window(|window| window.handle_touch(&touch, event));
         }
+    }
+
+    /// Delivers hardware key presses to GPUI and returns those UIKit should
+    /// still receive, such as keys GPUI left for text input.
+    fn unhandled_presses(
+        &self,
+        presses: &NSSet<UIPress>,
+        transition: KeyTransition,
+    ) -> Option<Retained<NSSet<UIPress>>> {
+        let unhandled: Vec<Retained<UIPress>> = presses
+            .iter()
+            .filter(|press| {
+                !self
+                    .ivars()
+                    .with_window(|window| window.handle_press(press, transition))
+                    .unwrap_or(false)
+            })
+            .collect();
+        (!unhandled.is_empty()).then(|| NSSet::from_retained_slice(&unhandled))
     }
 }
 
@@ -289,6 +342,8 @@ pub(crate) struct IosWindowState {
     mouse_position: Cell<Point<Pixels>>,
     /// Current modifiers
     modifiers: Cell<Modifiers>,
+    capslock: Cell<Capslock>,
+    keyboard: RefCell<HardwareKeyboard>,
     renderer: Mutex<MetalRenderer>,
 }
 
@@ -448,6 +503,8 @@ impl IosWindow {
             keyboard_height: Cell::new(0.),
             mouse_position: Cell::new(Point::default()),
             modifiers: Cell::new(Modifiers::default()),
+            capslock: Cell::new(Capslock::default()),
+            keyboard: RefCell::default(),
             renderer: Mutex::new(renderer),
         };
 
@@ -467,6 +524,7 @@ impl IosWindow {
         self.text_input_view.set_window(window);
 
         self.state.register_keyboard_observers();
+        self.state.claim_key_input();
     }
 }
 
@@ -474,6 +532,7 @@ impl IosWindowState {
     pub(super) fn attach_to_scene(&self, scene: &UIWindowScene) {
         self.window.setWindowScene(Some(scene));
         self.window.makeKeyAndVisible();
+        self.claim_key_input();
         self.handle_layout_change();
     }
 
@@ -545,8 +604,53 @@ impl IosWindowState {
             force: touch_force(touch),
         };
         self.handle_keyboard_dismiss_touch(&event);
+        if event.phase == TouchPhase::Started {
+            self.claim_key_input();
+        }
         self.input_callback
             .with(|callback| callback(PlatformInput::Touch(event)));
+    }
+
+    /// Makes the GPUI view the first responder, which UIKit delivers hardware
+    /// key presses to, unless the text input view holds it for a text field.
+    pub(super) fn claim_key_input(&self) {
+        if !self.text_input_view.isFirstResponder() && !self.view.isFirstResponder() {
+            self.view.becomeFirstResponder();
+        }
+    }
+
+    /// Delivers one phase of a hardware key press and returns whether GPUI
+    /// consumed it, so that UIKit must not receive it.
+    fn handle_press(&self, press: &UIPress, transition: KeyTransition) -> bool {
+        let Some(key_press) = key_press(press, self.view.mtm()) else {
+            return false;
+        };
+        self.capslock.set(key_press.capslock);
+        let input = self.keyboard.borrow_mut().input(&key_press, transition);
+        self.modifiers.set(self.keyboard.borrow().modifiers());
+        let handled = match input {
+            Some(PlatformInput::KeyDown(_)) if self.is_composing_text() => false,
+            Some(input @ PlatformInput::KeyDown(_)) => self
+                .input_callback
+                .with(|callback| callback(input))
+                .is_some_and(|result| !result.propagate),
+            Some(input) => {
+                self.input_callback.with(|callback| callback(input));
+                false
+            }
+            None => false,
+        };
+        !self
+            .keyboard
+            .borrow_mut()
+            .forward(key_press.usage, transition, handled)
+    }
+
+    /// While a text field composes text, its keys belong to the input method.
+    fn is_composing_text(&self) -> bool {
+        self.with_input_handler(|handler| handler.marked_text_range())
+            .flatten()
+            .is_some()
     }
 
     /// Delivers one step of a trackpad or mouse-wheel scroll gesture.
@@ -889,8 +993,7 @@ impl PlatformWindow for IosWindow {
     }
 
     fn capslock(&self) -> Capslock {
-        // Would need to check UIKeyModifierFlags
-        Capslock { on: false }
+        self.capslock.get()
     }
 
     fn set_input_handler(&mut self, input_handler: PlatformInputHandler) {
