@@ -172,6 +172,7 @@ define_class!(
                 let previous = self.ivars().reconciling_responder.replace(true);
                 self.resignFirstResponder();
                 self.ivars().reconciling_responder.set(previous);
+                if let Some(gpui_view) = self.superview() { gpui_view.becomeFirstResponder(); }
             }
             if self.ivars().configuration_changed.replace(false) && self.isFirstResponder() {
                 self.reloadInputViews();

@@ -48,8 +48,8 @@ pub struct IosPlatform(Rc<IosPlatformState>);
 
 pub(crate) struct IosPlatformState {
     pub(super) application: IosApplicationState,
-    background_executor: BackgroundExecutor,
-    foreground_executor: ForegroundExecutor,
+    pub(super) background_executor: BackgroundExecutor,
+    pub(super) foreground_executor: ForegroundExecutor,
     text_system: Arc<dyn PlatformTextSystem>,
     thermal_observer: RefCell<Option<ThermalObserver>>,
     display_observers: RefCell<Vec<Retained<ProtocolObject<dyn NSObjectProtocol>>>>,

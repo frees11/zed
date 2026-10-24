@@ -1,12 +1,14 @@
 //! Conversion from UIKit events to GPUI input events.
 
+use crate::keyboard::{HidUsage, KeyPress};
 use gpui::{
-    BackGestureEvent, BackGesturePhase, Modifiers, Pixels, Point, ScrollDelta, ScrollEvent,
-    ScrollSource, TouchId, TouchPhase, px,
+    BackGestureEvent, BackGesturePhase, Capslock, Modifiers, Pixels, Point, ScrollDelta,
+    ScrollEvent, ScrollSource, TouchId, TouchPhase, px,
 };
+use objc2::MainThreadMarker;
 use objc2_core_foundation::CGPoint;
 use objc2_ui_kit::{
-    UIGestureRecognizerState, UIKeyModifierFlags, UIPanGestureRecognizer, UIRectEdge,
+    UIGestureRecognizerState, UIKeyModifierFlags, UIPanGestureRecognizer, UIPress, UIRectEdge,
     UIScreenEdgePanGestureRecognizer, UITouch, UITouchPhase, UIView,
 };
 
@@ -106,6 +108,23 @@ pub fn scroll_event(recognizer: &UIPanGestureRecognizer, view: &UIView) -> Optio
         modifiers: modifiers(recognizer.modifierFlags()),
         touch_phase,
         source: ScrollSource::Pointer,
+    })
+}
+
+/// Reads the hardware key a press describes. Presses from other sources, such
+/// as a remote, and keys with usages beyond the HID keyboard page carry none.
+pub fn key_press(press: &UIPress, main_thread: MainThreadMarker) -> Option<KeyPress> {
+    let key = press.key(main_thread)?;
+    let usage = u16::try_from(key.keyCode().0).ok()?;
+    let flags = key.modifierFlags();
+    Some(KeyPress {
+        usage: HidUsage(usage),
+        modifiers: modifiers(flags),
+        capslock: Capslock {
+            on: flags.contains(UIKeyModifierFlags::AlphaShift),
+        },
+        characters: key.characters().to_string(),
+        characters_ignoring_modifiers: key.charactersIgnoringModifiers().to_string(),
     })
 }
 
