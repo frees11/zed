@@ -1,17 +1,23 @@
 #![allow(clippy::disallowed_methods, reason = "build scripts are exempt")]
 
+const PRECOMPILED_SHADERS_CFG: &str = "gpui_windows_precompiled_shaders";
+
+/// Release builds on a Windows host compile the HLSL shaders with `fxc.exe` and embed the bytecode.
+/// Every other build of a Windows target (debug, or cross-compiled from another host) compiles the
+/// embedded HLSL source at runtime with `D3DCompile`, so it needs `d3dcompiler_47.dll` on the target.
 fn main() {
-    #[cfg(not(all(target_os = "windows", not(debug_assertions))))]
     println!("cargo:rerun-if-changed=build.rs");
-    #[cfg(target_os = "windows")]
-    {
-        // Compile HLSL shaders
-        #[cfg(not(debug_assertions))]
-        compile_shaders();
+    println!("cargo::rustc-check-cfg=cfg({PRECOMPILED_SHADERS_CFG})");
+    let target_is_windows = std::env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "windows");
+    let debug_assertions = std::env::var_os("CARGO_CFG_DEBUG_ASSERTIONS").is_some();
+    if target_is_windows && !debug_assertions && cfg!(target_os = "windows") {
+        #[cfg(target_os = "windows")]
+        shader_compilation::compile_shaders();
+        println!("cargo:rustc-cfg={PRECOMPILED_SHADERS_CFG}");
     }
 }
 
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
+#[cfg(target_os = "windows")]
 mod shader_compilation {
     use std::{
         fs,
@@ -239,6 +245,3 @@ mod shader_compilation {
             .expect("Failed to write Rust binding file");
     }
 }
-
-#[cfg(all(target_os = "windows", not(debug_assertions)))]
-use shader_compilation::compile_shaders;

@@ -1697,13 +1697,16 @@ const BUFFER_COUNT: usize = 3;
 pub(crate) mod shader_resources {
     use anyhow::Result;
 
-    #[cfg(debug_assertions)]
+    #[cfg(not(gpui_windows_precompiled_shaders))]
     use windows::{
         Win32::Graphics::Direct3D::{
-            Fxc::{D3DCOMPILE_DEBUG, D3DCOMPILE_SKIP_OPTIMIZATION, D3DCompileFromFile},
-            ID3DBlob,
+            Fxc::{
+                D3DCOMPILE_DEBUG, D3DCOMPILE_OPTIMIZATION_LEVEL3, D3DCOMPILE_SKIP_OPTIMIZATION,
+                D3DCompile,
+            },
+            ID3DBlob, ID3DInclude,
         },
-        core::{HSTRING, PCSTR},
+        core::PCSTR,
     };
 
     #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -1728,17 +1731,17 @@ pub(crate) mod shader_resources {
     pub(crate) struct RawShaderBytes<'t> {
         inner: &'t [u8],
 
-        #[cfg(debug_assertions)]
+        #[cfg(not(gpui_windows_precompiled_shaders))]
         _blob: ID3DBlob,
     }
 
     impl<'t> RawShaderBytes<'t> {
         pub(crate) fn new(module: ShaderModule, target: ShaderTarget) -> Result<Self> {
-            #[cfg(not(debug_assertions))]
+            #[cfg(gpui_windows_precompiled_shaders)]
             {
                 Ok(Self::from_bytes(module, target))
             }
-            #[cfg(debug_assertions)]
+            #[cfg(not(gpui_windows_precompiled_shaders))]
             {
                 let blob = build_shader_blob(module, target)?;
                 let inner = unsafe {
@@ -1755,7 +1758,7 @@ pub(crate) mod shader_resources {
             self.inner
         }
 
-        #[cfg(not(debug_assertions))]
+        #[cfg(gpui_windows_precompiled_shaders)]
         fn from_bytes(module: ShaderModule, target: ShaderTarget) -> Self {
             let bytes = match module {
                 ShaderModule::Quad => match target {
@@ -1799,53 +1802,77 @@ pub(crate) mod shader_resources {
         }
     }
 
-    #[cfg(debug_assertions)]
+    #[cfg(not(gpui_windows_precompiled_shaders))]
+    const ALPHA_CORRECTION_FILE: &str = "alpha_correction.hlsl";
+
+    #[cfg(not(gpui_windows_precompiled_shaders))]
+    const ALPHA_CORRECTION_INCLUDE: &str = "#include \"alpha_correction.hlsl\"";
+
+    /// The HLSL source for `module` with its single `#include` expanded, because `D3DCompile` gets
+    /// no include handler: the source is embedded and the files do not exist on the target machine.
+    /// `#line` directives around the inlined file keep compiler diagnostics on the file and line
+    /// they come from.
+    #[cfg(not(gpui_windows_precompiled_shaders))]
+    fn shader_source(module: ShaderModule) -> Result<(&'static str, String)> {
+        let (name, source) = if matches!(module, ShaderModule::EmojiRasterization) {
+            (
+                "color_text_raster.hlsl\0",
+                include_str!("color_text_raster.hlsl"),
+            )
+        } else {
+            ("shaders.hlsl\0", include_str!("shaders.hlsl"))
+        };
+        let file = name.trim_end_matches('\0');
+        let alpha_correction = include_str!("alpha_correction.hlsl");
+        anyhow::ensure!(
+            alpha_correction.ends_with('\n'),
+            "{ALPHA_CORRECTION_FILE} must end with a newline before the #line that follows it"
+        );
+        let Some(include_start) = source.find(ALPHA_CORRECTION_INCLUDE) else {
+            anyhow::bail!("{file} no longer includes {ALPHA_CORRECTION_FILE}");
+        };
+        let (before, rest) = source.split_at(include_start);
+        let after = &rest[ALPHA_CORRECTION_INCLUDE.len()..];
+        let line_after_include = before.matches('\n').count() + 2;
+        let expanded = format!(
+            "{before}#line 1 \"{ALPHA_CORRECTION_FILE}\"\n{alpha_correction}#line {line_after_include} \"{file}\"{after}"
+        );
+        Ok((name, expanded))
+    }
+
+    #[cfg(not(gpui_windows_precompiled_shaders))]
     pub(super) fn build_shader_blob(entry: ShaderModule, target: ShaderTarget) -> Result<ID3DBlob> {
+        let (source_name, source) = shader_source(entry)?;
+        let entry = format!(
+            "{}_{}\0",
+            entry.as_str(),
+            match target {
+                ShaderTarget::Vertex => "vertex",
+                ShaderTarget::Fragment => "fragment",
+            }
+        );
+        let target = match target {
+            ShaderTarget::Vertex => "vs_4_1\0",
+            ShaderTarget::Fragment => "ps_4_1\0",
+        };
+        let flags = if cfg!(debug_assertions) {
+            D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION
+        } else {
+            D3DCOMPILE_OPTIMIZATION_LEVEL3
+        };
+
+        let mut compile_blob = None;
+        let mut error_blob = None;
         unsafe {
-            use windows::Win32::Graphics::{
-                Direct3D::ID3DInclude, Hlsl::D3D_COMPILE_STANDARD_FILE_INCLUDE,
-            };
-
-            let shader_name = if matches!(entry, ShaderModule::EmojiRasterization) {
-                "color_text_raster.hlsl"
-            } else {
-                "shaders.hlsl"
-            };
-
-            let entry = format!(
-                "{}_{}\0",
-                entry.as_str(),
-                match target {
-                    ShaderTarget::Vertex => "vertex",
-                    ShaderTarget::Fragment => "fragment",
-                }
-            );
-            let target = match target {
-                ShaderTarget::Vertex => "vs_4_1\0",
-                ShaderTarget::Fragment => "ps_4_1\0",
-            };
-
-            let mut compile_blob = None;
-            let mut error_blob = None;
-            let shader_path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-                .join(&format!("src/{}", shader_name))
-                .canonicalize()?;
-
-            let entry_point = PCSTR::from_raw(entry.as_ptr());
-            let target_cstr = PCSTR::from_raw(target.as_ptr());
-
-            // really dirty trick because winapi bindings are unhappy otherwise
-            let include_handler = &std::mem::transmute::<usize, ID3DInclude>(
-                D3D_COMPILE_STANDARD_FILE_INCLUDE as usize,
-            );
-
-            let ret = D3DCompileFromFile(
-                &HSTRING::from(shader_path.to_str().unwrap()),
+            let ret = D3DCompile(
+                source.as_ptr().cast(),
+                source.len(),
+                PCSTR::from_raw(source_name.as_ptr()),
                 None,
-                include_handler,
-                entry_point,
-                target_cstr,
-                D3DCOMPILE_DEBUG | D3DCOMPILE_SKIP_OPTIMIZATION,
+                None::<&ID3DInclude>,
+                PCSTR::from_raw(entry.as_ptr()),
+                PCSTR::from_raw(target.as_ptr()),
+                flags,
                 0,
                 &mut compile_blob,
                 Some(&mut error_blob),
@@ -1861,14 +1888,14 @@ pub(crate) mod shader_resources {
                 log::error!("Shader compile error: {}", error_string);
                 return Err(anyhow::anyhow!("Compile error: {}", error_string));
             }
-            Ok(compile_blob.unwrap())
         }
+        compile_blob.ok_or_else(|| anyhow::anyhow!("D3DCompile returned no bytecode for {entry}"))
     }
 
-    #[cfg(not(debug_assertions))]
+    #[cfg(gpui_windows_precompiled_shaders)]
     include!(concat!(env!("OUT_DIR"), "/shaders_bytes.rs"));
 
-    #[cfg(debug_assertions)]
+    #[cfg(not(gpui_windows_precompiled_shaders))]
     impl ShaderModule {
         pub fn as_str(self) -> &'static str {
             match self {
@@ -1882,6 +1909,107 @@ pub(crate) mod shader_resources {
                 ShaderModule::PolychromeSprite => "polychrome_sprite",
                 ShaderModule::EmojiRasterization => "emoji_rasterization",
             }
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use anyhow::{Result, ensure};
+
+        use super::{RawShaderBytes, ShaderModule, ShaderTarget};
+
+        const DXBC_MAGIC: &[u8] = b"DXBC";
+
+        const ALL_MODULES: [ShaderModule; 9] = [
+            ShaderModule::Quad,
+            ShaderModule::Shadow,
+            ShaderModule::Underline,
+            ShaderModule::PathRasterization,
+            ShaderModule::PathSprite,
+            ShaderModule::MonochromeSprite,
+            ShaderModule::SubpixelSprite,
+            ShaderModule::PolychromeSprite,
+            ShaderModule::EmojiRasterization,
+        ];
+
+        #[cfg(not(gpui_windows_precompiled_shaders))]
+        #[test]
+        fn embedded_shader_sources_inline_alpha_correction() -> Result<()> {
+            for module in ALL_MODULES {
+                let (_, source) = super::shader_source(module)?;
+                ensure!(
+                    !source.contains("#include"),
+                    "{module:?} still has an #include"
+                );
+                ensure!(
+                    source.contains("float apply_alpha_correction("),
+                    "{module:?} lacks alpha_correction.hlsl"
+                );
+            }
+            Ok(())
+        }
+
+        #[cfg(not(gpui_windows_precompiled_shaders))]
+        #[test]
+        fn embedded_shader_lines_report_their_own_file_and_line() -> Result<()> {
+            let files = [
+                ("shaders.hlsl", include_str!("shaders.hlsl")),
+                (
+                    "color_text_raster.hlsl",
+                    include_str!("color_text_raster.hlsl"),
+                ),
+                (
+                    super::ALPHA_CORRECTION_FILE,
+                    include_str!("alpha_correction.hlsl"),
+                ),
+            ];
+            for module in ALL_MODULES {
+                let (name, source) = super::shader_source(module)?;
+                let mut file = name.trim_end_matches('\0');
+                let mut line = 1;
+                let mut files_seen = Vec::new();
+                for text in source.lines() {
+                    if let Some(directive) = text.strip_prefix("#line ") {
+                        let Some((number, quoted)) = directive.split_once(' ') else {
+                            anyhow::bail!("{module:?}: `{text}` names no file");
+                        };
+                        line = number.parse()?;
+                        file = quoted.trim_matches('"');
+                        files_seen.push(file);
+                        continue;
+                    }
+                    let Some((_, original)) = files.iter().find(|(name, _)| *name == file) else {
+                        anyhow::bail!("{module:?}: #line names the unknown file {file}");
+                    };
+                    ensure!(
+                        original.lines().nth(line - 1) == Some(text),
+                        "{module:?}: `{text}` is reported as {file}:{line}"
+                    );
+                    line += 1;
+                }
+                ensure!(
+                    files_seen.first() == Some(&super::ALPHA_CORRECTION_FILE),
+                    "{module:?}: the inlined {} has no #line",
+                    super::ALPHA_CORRECTION_FILE
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn every_shader_module_yields_dxbc_bytecode() -> Result<()> {
+            let mut failures = Vec::new();
+            for module in ALL_MODULES {
+                for target in [ShaderTarget::Vertex, ShaderTarget::Fragment] {
+                    match RawShaderBytes::new(module, target) {
+                        Ok(shader) if shader.as_bytes().starts_with(DXBC_MAGIC) => {}
+                        Ok(_) => failures.push(format!("{module:?} {target:?}: not DXBC bytecode")),
+                        Err(error) => failures.push(format!("{module:?} {target:?}: {error:#}")),
+                    }
+                }
+            }
+            ensure!(failures.is_empty(), "{}", failures.join("\n"));
+            Ok(())
         }
     }
 }
