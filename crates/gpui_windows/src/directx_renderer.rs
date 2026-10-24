@@ -54,6 +54,7 @@ pub(crate) struct DirectXRenderer {
     /// In that case we want to discard the first frame that we draw as we got reset in the middle of a frame
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
+    unsupported_external_surfaces: UnsupportedExternalSurfaces,
 }
 
 /// Direct3D objects
@@ -194,6 +195,7 @@ impl DirectXRenderer {
             width: 1,
             height: 1,
             skip_draws: false,
+            unsupported_external_surfaces: UnsupportedExternalSurfaces::default(),
         })
     }
 
@@ -385,6 +387,11 @@ impl DirectXRenderer {
                     self.draw_polychrome_sprites(texture_id, range.start, range.len())
                 }
                 PrimitiveBatch::Surfaces(range) => self.draw_surfaces(&scene.surfaces[range]),
+                PrimitiveBatch::ExternalSurfaces(range) => {
+                    self.unsupported_external_surfaces
+                        .skip_all("DirectX", &scene.external_surfaces[range]);
+                    Ok(())
+                }
             }
             .with_context(|| {
                 format!(

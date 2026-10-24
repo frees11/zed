@@ -4,7 +4,7 @@ use bytemuck::{Pod, Zeroable};
 use collections::FxHashMap;
 use gpui::{
     AtlasTextureId, Background, Bounds, DevicePixels, GpuSpecs, Path, Point, PrimitiveBatch,
-    ScaledPixels, Scene, Size, get_gamma_correction_ratios,
+    ScaledPixels, Scene, Size, UnsupportedExternalSurfaces, get_gamma_correction_ratios,
 };
 use log::warn;
 #[cfg(not(target_family = "wasm"))]
@@ -225,6 +225,7 @@ struct WgpuRendererCore {
     adapter_info: wgpu::AdapterInfo,
     target_format: wgpu::TextureFormat,
     max_texture_size: u32,
+    unsupported_external_surfaces: UnsupportedExternalSurfaces,
 }
 
 /// GPU resources of a windowed renderer. A surface is only ever configured against the
@@ -1361,6 +1362,7 @@ impl WgpuRendererCore {
             adapter_info: context.adapter.get_info(),
             target_format,
             max_texture_size,
+            unsupported_external_surfaces: UnsupportedExternalSurfaces::default(),
         }
     }
 
@@ -1606,6 +1608,9 @@ impl WgpuRendererCore {
                     // Surfaces are macOS-only for video playback and are not
                     // implemented by the WGPU renderer.
                     PrimitiveBatch::Surfaces(_surfaces) => {}
+                    PrimitiveBatch::ExternalSurfaces(range) => self
+                        .unsupported_external_surfaces
+                        .skip_all("wgpu", &scene.external_surfaces[range]),
                 }
             }
         }

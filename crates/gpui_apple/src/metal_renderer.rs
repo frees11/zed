@@ -4,7 +4,7 @@ use block2::RcBlock;
 use core_graphics::geometry::CGSize;
 use gpui::{
     AtlasTextureId, Background, Bounds, ContentMask, DevicePixels, PaintSurface, Path, Point,
-    PrimitiveBatch, ScaledPixels, Scene, Size, point, size,
+    PrimitiveBatch, ScaledPixels, Scene, Size, UnsupportedExternalSurfaces, point, size,
 };
 #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
 use image::RgbaImage;
@@ -138,6 +138,7 @@ pub struct MetalRenderer {
     /// rendering headlessly without reading pixels back.
     #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
     headless_render_target: Option<metal::Texture>,
+    unsupported_external_surfaces: UnsupportedExternalSurfaces,
 }
 
 #[repr(C)]
@@ -436,6 +437,7 @@ impl MetalRenderer {
             path_sample_count: PATH_SAMPLE_COUNT,
             #[cfg(any(test, feature = "bench-support", feature = "test-support"))]
             headless_render_target: None,
+            unsupported_external_surfaces: UnsupportedExternalSurfaces::default(),
         }
     }
 
@@ -820,6 +822,9 @@ impl MetalRenderer {
                     viewport_size,
                     command_encoder,
                 ),
+                PrimitiveBatch::ExternalSurfaces(range) => self
+                    .unsupported_external_surfaces
+                    .skip_all("Metal", &scene.external_surfaces[range]),
                 PrimitiveBatch::SubpixelSprites { .. } => unreachable!(),
             }
         }
@@ -1798,5 +1803,52 @@ mod tests {
             assert!(blue.abs_diff(128) <= 2);
             assert_eq!(*alpha, 255);
         }
+    }
+
+    #[test]
+    fn external_surfaces_are_skipped_without_drawing() {
+        let side = std::num::NonZeroU32::new(16).expect("16 is not zero");
+        let layout = gpui::Nv12Layout::packed(side, side);
+        let frame = gpui::CpuNv12Frame::new(
+            gpui::ExternalStreamId::new(),
+            1,
+            layout,
+            vec![255; 16 * 16],
+            vec![128; 16 * 8],
+            gpui::YuvColorMatrix::Bt601Full,
+        )
+        .expect("packed planes");
+        let bounds = Bounds {
+            origin: Point::default(),
+            size: size(ScaledPixels(16.0), ScaledPixels(16.0)),
+        };
+        let mut scene = Scene::default();
+        scene.insert_primitive(gpui::PaintExternalSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            surface: frame.into(),
+        });
+        scene.finish();
+
+        let mut renderer = MetalRenderer::new_headless(Arc::new(Mutex::new(Default::default())));
+        for _ in 0..2 {
+            let image = renderer
+                .render_scene_to_image(&scene, size(DevicePixels(16), DevicePixels(16)))
+                .unwrap();
+            assert!(
+                image
+                    .pixels()
+                    .all(|image::Rgba([red, green, blue, _])| *red == 0
+                        && *green == 0
+                        && *blue == 0)
+            );
+        }
+        assert!(
+            !renderer
+                .unsupported_external_surfaces
+                .skip("Metal", gpui::ExternalSurfaceKind::CpuNv12),
+            "the first skipped frame should already have been reported"
+        );
     }
 }

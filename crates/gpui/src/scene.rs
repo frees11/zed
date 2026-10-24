@@ -5,8 +5,8 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, Hsla, Pixels,
-    Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
+    AtlasTextureId, AtlasTile, Background, Bounds, ContentMask, Corners, Edges, ExternalSurface,
+    Hsla, Pixels, Point, Radians, ScaledPixels, Size, bounds_tree::BoundsTree, point,
 };
 use std::{
     fmt::Debug,
@@ -50,6 +50,7 @@ pub struct Scene {
     pub subpixel_sprites: Vec<SubpixelSprite>,
     pub polychrome_sprites: Vec<PolychromeSprite>,
     pub surfaces: Vec<PaintSurface>,
+    pub external_surfaces: Vec<PaintExternalSurface>,
 }
 
 #[expect(missing_docs)]
@@ -66,6 +67,7 @@ impl Scene {
         self.subpixel_sprites.clear();
         self.polychrome_sprites.clear();
         self.surfaces.clear();
+        self.external_surfaces.clear();
     }
 
     pub fn len(&self) -> usize {
@@ -133,6 +135,10 @@ impl Scene {
                 surface.order = order;
                 self.surfaces.push(surface.clone());
             }
+            Primitive::ExternalSurface(surface) => {
+                surface.order = order;
+                self.external_surfaces.push(surface.clone());
+            }
         }
         self.paint_operations
             .push(PaintOperation::Primitive(primitive));
@@ -160,6 +166,7 @@ impl Scene {
         self.polychrome_sprites
             .sort_by_key(|sprite| (sprite.order, sprite.tile.texture_id.index));
         self.surfaces.sort_by_key(|surface| surface.order);
+        self.external_surfaces.sort_by_key(|surface| surface.order);
     }
 
     #[cfg_attr(
@@ -187,6 +194,8 @@ impl Scene {
             polychrome_sprites_iter: self.polychrome_sprites.iter().peekable(),
             surfaces_start: 0,
             surfaces_iter: self.surfaces.iter().peekable(),
+            external_surfaces_start: 0,
+            external_surfaces_iter: self.external_surfaces.iter().peekable(),
         }
     }
 }
@@ -209,6 +218,7 @@ pub(crate) enum PrimitiveKind {
     SubpixelSprite,
     PolychromeSprite,
     Surface,
+    ExternalSurface,
 }
 
 pub(crate) enum PaintOperation {
@@ -228,6 +238,7 @@ pub enum Primitive {
     SubpixelSprite(SubpixelSprite),
     PolychromeSprite(PolychromeSprite),
     Surface(PaintSurface),
+    ExternalSurface(PaintExternalSurface),
 }
 
 #[expect(missing_docs)]
@@ -242,6 +253,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.bounds,
             Primitive::PolychromeSprite(sprite) => &sprite.bounds,
             Primitive::Surface(surface) => &surface.bounds,
+            Primitive::ExternalSurface(surface) => &surface.bounds,
         }
     }
 
@@ -255,6 +267,7 @@ impl Primitive {
             Primitive::SubpixelSprite(sprite) => &sprite.content_mask,
             Primitive::PolychromeSprite(sprite) => &sprite.content_mask,
             Primitive::Surface(surface) => &surface.content_mask,
+            Primitive::ExternalSurface(surface) => &surface.content_mask,
         }
     }
 }
@@ -283,6 +296,8 @@ struct BatchIterator<'a> {
     polychrome_sprites_iter: Peekable<slice::Iter<'a, PolychromeSprite>>,
     surfaces_start: usize,
     surfaces_iter: Peekable<slice::Iter<'a, PaintSurface>>,
+    external_surfaces_start: usize,
+    external_surfaces_iter: Peekable<slice::Iter<'a, PaintExternalSurface>>,
 }
 
 impl<'a> Iterator for BatchIterator<'a> {
@@ -315,6 +330,10 @@ impl<'a> Iterator for BatchIterator<'a> {
             (
                 self.surfaces_iter.peek().map(|s| s.order),
                 PrimitiveKind::Surface,
+            ),
+            (
+                self.external_surfaces_iter.peek().map(|s| s.order),
+                PrimitiveKind::ExternalSurface,
             ),
         ];
         orders_and_kinds.sort_by_key(|(order, kind)| (order.unwrap_or(u32::MAX), *kind));
@@ -461,6 +480,22 @@ impl<'a> Iterator for BatchIterator<'a> {
                 self.surfaces_start = surfaces_end;
                 Some(PrimitiveBatch::Surfaces(surfaces_start..surfaces_end))
             }
+            PrimitiveKind::ExternalSurface => {
+                let surfaces_start = self.external_surfaces_start;
+                let mut surfaces_end = surfaces_start + 1;
+                self.external_surfaces_iter.next();
+                while self
+                    .external_surfaces_iter
+                    .next_if(|surface| (surface.order, batch_kind) < max_order_and_kind)
+                    .is_some()
+                {
+                    surfaces_end += 1;
+                }
+                self.external_surfaces_start = surfaces_end;
+                Some(PrimitiveBatch::ExternalSurfaces(
+                    surfaces_start..surfaces_end,
+                ))
+            }
         }
     }
 }
@@ -493,6 +528,7 @@ pub enum PrimitiveBatch {
         range: Range<usize>,
     },
     Surfaces(Range<usize>),
+    ExternalSurfaces(Range<usize>),
 }
 
 impl PrimitiveBatch {
@@ -525,6 +561,7 @@ impl PrimitiveBatch {
                 )
             }
             Self::Surfaces(range) => format!("surfaces ({})", range.len()),
+            Self::ExternalSurfaces(range) => format!("external surfaces ({})", range.len()),
         }
     }
 }
@@ -779,6 +816,25 @@ impl From<PaintSurface> for Primitive {
     }
 }
 
+/// A video frame decoded outside GPUI, stretched over `bounds` and clipped to `content_mask`.
+#[derive(Clone, Debug)]
+pub struct PaintExternalSurface {
+    /// The frame's draw order, assigned when the scene inserts it.
+    pub order: DrawOrder,
+    /// Where the frame is drawn.
+    pub bounds: Bounds<ScaledPixels>,
+    /// The region the frame is clipped to.
+    pub content_mask: ContentMask<ScaledPixels>,
+    /// The frame.
+    pub surface: ExternalSurface,
+}
+
+impl From<PaintExternalSurface> for Primitive {
+    fn from(surface: PaintExternalSurface) -> Self {
+        Primitive::ExternalSurface(surface)
+    }
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[expect(missing_docs)]
 pub struct PathId(pub usize);
@@ -945,5 +1001,81 @@ impl PathVertex<Pixels> {
             st_position: self.st_position,
             content_mask: self.content_mask.scale(factor),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{CpuNv12Frame, ExternalStreamId, Nv12Layout, YuvColorMatrix, size};
+    use std::num::NonZeroU32;
+
+    fn square_at(x: f32) -> Bounds<ScaledPixels> {
+        Bounds {
+            origin: point(ScaledPixels(x), ScaledPixels(0.)),
+            size: size(ScaledPixels(10.), ScaledPixels(10.)),
+        }
+    }
+
+    fn quad_at(x: f32) -> Quad {
+        let bounds = square_at(x);
+        Quad {
+            bounds,
+            content_mask: ContentMask { bounds },
+            ..Quad::default()
+        }
+    }
+
+    fn external_surface_at(x: f32, generation: u64) -> PaintExternalSurface {
+        let side = NonZeroU32::new(2).expect("2 is not zero");
+        let bounds = square_at(x);
+        let frame = CpuNv12Frame::new(
+            ExternalStreamId::new(),
+            generation,
+            Nv12Layout::packed(side, side),
+            vec![128; 4],
+            vec![128; 2],
+            YuvColorMatrix::Bt601Full,
+        )
+        .expect("packed 2x2 planes");
+        PaintExternalSurface {
+            order: 0,
+            bounds,
+            content_mask: ContentMask { bounds },
+            surface: frame.into(),
+        }
+    }
+
+    #[test]
+    fn external_surfaces_batch_between_the_primitives_they_overlap() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(quad_at(0.));
+        scene.insert_primitive(external_surface_at(5., 3));
+        scene.insert_primitive(quad_at(8.));
+        scene.finish();
+
+        let batches = scene.batches().collect::<Vec<_>>();
+        assert!(
+            matches!(
+                batches.as_slice(),
+                [
+                    PrimitiveBatch::Quads(first),
+                    PrimitiveBatch::ExternalSurfaces(surfaces),
+                    PrimitiveBatch::Quads(second),
+                ] if *first == (0..1) && *surfaces == (0..1) && *second == (1..2)
+            ),
+            "{batches:?}"
+        );
+        assert_eq!(scene.external_surfaces[0].surface.generation(), 3);
+        assert_eq!(scene.external_surfaces[0].bounds, square_at(5.));
+    }
+
+    #[test]
+    fn clear_drops_external_surfaces() {
+        let mut scene = Scene::default();
+        scene.insert_primitive(external_surface_at(0., 0));
+        scene.clear();
+        assert!(scene.external_surfaces.is_empty());
+        assert_eq!(scene.batches().count(), 0);
     }
 }

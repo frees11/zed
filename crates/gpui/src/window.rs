@@ -24,6 +24,7 @@ use crate::{
     WindowBounds, WindowControls, WindowDecorations, WindowInsets, WindowOptions, WindowParams,
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
+use crate::{ExternalSurface, PaintExternalSurface};
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
@@ -5187,6 +5188,26 @@ impl Window {
             content_mask,
             image_buffer,
         });
+    }
+
+    /// Paint a video frame decoded outside GPUI into the scene for the next frame at the
+    /// current z-index, stretched over `bounds`. Renderers that cannot draw the surface's
+    /// kind skip it.
+    ///
+    /// This method should only be called as part of the paint phase of element drawing.
+    pub fn paint_external_surface(&mut self, bounds: Bounds<Pixels>, surface: ExternalSurface) {
+        self.invalidator.debug_assert_paint();
+
+        let bounds = self.snap_bounds(bounds);
+        let content_mask = self.snapped_content_mask();
+        self.next_frame
+            .scene
+            .insert_primitive(PaintExternalSurface {
+                order: 0,
+                bounds,
+                content_mask,
+                surface,
+            });
     }
 
     /// Removes an image from the sprite atlas.
