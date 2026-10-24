@@ -9,10 +9,10 @@ use objc2::{
     sel,
 };
 use objc2_foundation::{
-    NSDictionary, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSSet, NSString,
-    NSUserActivity, NSUserActivityTypeBrowsingWeb,
+    NSDictionary, NSInteger, NSObject, NSObjectProtocol, NSRunLoop, NSRunLoopCommonModes, NSSet,
+    NSString, NSUserActivity, NSUserActivityTypeBrowsingWeb,
 };
-use objc2_quartz_core::CADisplayLink;
+use objc2_quartz_core::{CADisplayLink, CAFrameRateRange};
 use objc2_ui_kit::{
     UIApplication, UIApplicationDelegate, UIApplicationLaunchOptionsKey, UIOpenURLContext, UIScene,
     UISceneConfiguration, UISceneConnectionOptions, UISceneDelegate, UISceneSession, UIWindowScene,
@@ -21,6 +21,18 @@ use objc2_ui_kit::{
 use std::{
     cell::{Cell, RefCell},
     rc::{Rc, Weak},
+};
+
+/// Displays refreshing this often or faster are ProMotion displays.
+const PROMOTION_FRAMES_PER_SECOND: NSInteger = 120;
+
+/// On ProMotion displays the display link asks for the full 120 Hz and never
+/// drops below 80 Hz, so the next frame is at most 12.5 ms away. iPhones only
+/// exceed 60 Hz when the app's Info.plist sets `CADisableMinimumFrameDurationOnPhone`.
+const PROMOTION_FRAME_RATE_RANGE: CAFrameRateRange = CAFrameRateRange {
+    minimum: 80.,
+    maximum: 120.,
+    preferred: 120.,
 };
 
 #[derive(Default)]
@@ -339,6 +351,9 @@ define_class!(
                 );
                 display_link
             };
+            if scene.screen().maximumFramesPerSecond() >= PROMOTION_FRAMES_PER_SECOND {
+                display_link.setPreferredFrameRateRange(PROMOTION_FRAME_RATE_RANGE);
+            }
             *application.display_link.borrow_mut() = Some(display_link);
         }
 
