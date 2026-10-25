@@ -15,8 +15,11 @@ use wayland_protocols::wp::cursor_shape::v1::client::wp_cursor_shape_device_v1::
 
 use gpui::CursorStyle;
 
-pub(super) fn to_shape(style: CursorStyle) -> Shape {
-    match style {
+/// The cursor-shape-v1 shape of `style`; none for `CursorStyle::None`, which has no shape and
+/// hides the cursor instead.
+pub(super) fn to_shape(style: CursorStyle) -> Option<Shape> {
+    Some(match style {
+        CursorStyle::None => return None,
         CursorStyle::Arrow => Shape::Default,
         CursorStyle::IBeam => Shape::Text,
         CursorStyle::Crosshair => Shape::Crosshair,
@@ -38,5 +41,20 @@ pub(super) fn to_shape(style: CursorStyle) -> Shape {
         CursorStyle::DragLink => Shape::Alias,
         CursorStyle::DragCopy => Shape::Copy,
         CursorStyle::ContextualMenu => Shape::ContextMenu,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_the_hidden_cursor_has_no_shape() {
+        assert_eq!(to_shape(CursorStyle::None), None);
+        assert_eq!(to_shape(CursorStyle::Arrow), Some(Shape::Default));
+        assert_eq!(
+            to_shape(CursorStyle::ContextualMenu),
+            Some(Shape::ContextMenu)
+        );
     }
 }

@@ -40,8 +40,8 @@ use objc2::{
 use objc2_app_kit::NSFilenamesPboardType;
 use objc2_app_kit::{
     NSAlert, NSAlertStyle, NSAppearance, NSAutoresizingMaskOptions, NSBackingStoreType, NSBeep,
-    NSButton, NSColor, NSDragOperation, NSDraggingContext, NSDraggingImageComponent,
-    NSDraggingImageComponentIconKey, NSDraggingItem, NSEventModifierFlags, NSEventType,
+    NSButton, NSColor, NSCursor, NSDragOperation, NSDraggingContext, NSDraggingImageComponent,
+    NSDraggingImageComponentIconKey, NSDraggingItem, NSEventModifierFlags, NSEventType, NSImage,
     NSPasteboardWriting, NSRequestUserAttentionType, NSScreen, NSTrackingArea,
     NSTrackingAreaOptions, NSView, NSViewLayerContentsRedrawPolicy, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSWindow, NSWindowAnimationBehavior,
@@ -2509,6 +2509,7 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
         let window_state = get_window_state(this);
         let cursor_style = window_state.lock().cursor_style;
 
+        let invisible: Retained<NSCursor>;
         let cursor: *mut AnyObject = match cursor_style {
             CursorStyle::Arrow => msg_send![class!(NSCursor), arrowCursor],
             CursorStyle::IBeam => msg_send![class!(NSCursor), IBeamCursor],
@@ -2543,11 +2544,23 @@ extern "C" fn reset_cursor_rects(this: &AnyObject, _: Sel) {
             CursorStyle::DragLink => msg_send![class!(NSCursor), dragLinkCursor],
             CursorStyle::DragCopy => msg_send![class!(NSCursor), dragCopyCursor],
             CursorStyle::ContextualMenu => msg_send![class!(NSCursor), contextualMenuCursor],
+            CursorStyle::None => {
+                invisible = invisible_cursor();
+                Retained::as_ptr(&invisible).cast_mut().cast()
+            }
         };
 
         let bounds: NSRect = msg_send![this, bounds];
         let _: () = msg_send![this, addCursorRect: bounds, cursor: cursor];
     }
+}
+
+/// A cursor without pixels. `CursorStyle::None` registers it as the cursor of the whole view,
+/// so the pointer stays hidden over the window, also while the mouse moves, until another
+/// style is set.
+fn invisible_cursor() -> Retained<NSCursor> {
+    let image = NSImage::initWithSize(NSImage::alloc(), NSSize::new(1., 1.));
+    NSCursor::initWithImage_hotSpot(NSCursor::alloc(), &image, NSPoint::new(0., 0.))
 }
 
 extern "C" fn handle_key_equivalent(
@@ -4005,6 +4018,24 @@ extern "C" fn toggle_tab_bar(this: &AnyObject, _sel: Sel, _id: *mut AnyObject) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_hidden_cursor_draws_nothing_and_is_not_the_arrow() {
+        autoreleasepool(|_| {
+            let cursor = invisible_cursor();
+            let image = cursor.image();
+            assert_eq!(image.size(), NSSize::new(1., 1.));
+            let representations: *mut AnyObject = unsafe { msg_send![&*image, representations] };
+            let representation_count: NSUInteger = unsafe { msg_send![representations, count] };
+            assert_eq!(representation_count, 0, "the image has no pixels");
+            assert_eq!(cursor.hotSpot(), NSPoint::new(0., 0.));
+            let arrow: *mut AnyObject = unsafe { msg_send![class!(NSCursor), arrowCursor] };
+            assert_ne!(
+                Retained::as_ptr(&cursor).cast_mut().cast::<AnyObject>(),
+                arrow
+            );
+        });
+    }
 
     #[test]
     fn display_id_for_screen_handles_missing_metadata() {

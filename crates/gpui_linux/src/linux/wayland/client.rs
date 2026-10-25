@@ -842,10 +842,6 @@ impl WaylandClientState {
             return;
         };
         let serial = self.serial_tracker.get(SerialKind::MouseEnter);
-        if let Some(cursor_shape_device) = &self.cursor_shape_device {
-            cursor_shape_device.set_shape(serial.as_raw(), to_shape(style));
-            return;
-        }
         let Some(focused_window) = self.mouse_focused_window.clone() else {
             log::warn!(
                 "wayland: no focused surface to restore cursor style {:?} after hide; cursor may stay invisible",
@@ -860,13 +856,32 @@ impl WaylandClientState {
             );
             return;
         };
-        let scale = focused_window.primary_output_scale();
-        self.cursor.set_icon(
-            &wl_pointer,
-            serial.as_raw(),
-            cursor_style_to_icon_names(style),
-            scale,
-        );
+        self.show_cursor_style(&wl_pointer, serial.as_raw(), style, &focused_window);
+    }
+
+    /// Shows `style` on the pointer that entered `window` with `serial`, or hides the pointer
+    /// for `CursorStyle::None`, which stays hidden over the window until another style is set.
+    fn show_cursor_style(
+        &mut self,
+        wl_pointer: &wl_pointer::WlPointer,
+        serial: u32,
+        style: CursorStyle,
+        window: &WaylandWindowStatePtr,
+    ) {
+        let Some(icon_names) = cursor_style_to_icon_names(style) else {
+            wl_pointer.set_cursor(serial, None, 0, 0);
+            return;
+        };
+        match (&self.cursor_shape_device, to_shape(style)) {
+            (Some(cursor_shape_device), Some(shape)) => {
+                cursor_shape_device.set_shape(serial, shape)
+            }
+            _ => {
+                // cursor-shape-v1 isn't supported, set the cursor using a surface.
+                let scale = window.primary_output_scale();
+                self.cursor.set_icon(wl_pointer, serial, icon_names, scale);
+            }
+        }
     }
 }
 
@@ -1367,21 +1382,12 @@ impl WaylandConnection {
         }
 
         let serial = state.serial_tracker.get(SerialKind::MouseEnter);
-        if let Some(cursor_shape_device) = &state.cursor_shape_device {
-            cursor_shape_device.set_shape(serial.as_raw(), to_shape(style));
-        } else if let Some(focused_window) = &state.mouse_focused_window {
-            // cursor-shape-v1 isn't supported, set the cursor using a surface.
+        if let Some(focused_window) = state.mouse_focused_window.clone() {
             let wl_pointer = state
                 .wl_pointer
                 .clone()
                 .expect("window is focused by pointer");
-            let scale = focused_window.primary_output_scale();
-            state.cursor.set_icon(
-                &wl_pointer,
-                serial.as_raw(),
-                cursor_style_to_icon_names(style),
-                scale,
-            );
+            state.show_cursor_style(&wl_pointer, serial.as_raw(), style, &focused_window);
         }
     }
 
@@ -2407,17 +2413,7 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                     }
                     state.restore_cursor_after_hide();
                     if let Some(style) = state.cursor_style {
-                        if let Some(cursor_shape_device) = &state.cursor_shape_device {
-                            cursor_shape_device.set_shape(serial, to_shape(style));
-                        } else {
-                            let scale = window.primary_output_scale();
-                            state.cursor.set_icon(
-                                wl_pointer,
-                                serial,
-                                cursor_style_to_icon_names(style),
-                                scale,
-                            );
-                        }
+                        state.show_cursor_style(wl_pointer, serial, style, &window);
                     }
                     let modifiers = state.modifiers;
                     drop(state);
@@ -2465,24 +2461,16 @@ impl Dispatch<wl_pointer::WlPointer, ()> for WaylandClientStatePtr {
                         if state.cursor_style != Some(default_style) {
                             let serial = state.serial_tracker.get(SerialKind::MouseEnter);
                             state.cursor_style = Some(default_style);
-
-                            if let Some(cursor_shape_device) = &state.cursor_shape_device {
-                                cursor_shape_device
-                                    .set_shape(serial.as_raw(), to_shape(default_style));
-                            } else {
-                                // cursor-shape-v1 isn't supported, set the cursor using a surface.
-                                let wl_pointer = state
-                                    .wl_pointer
-                                    .clone()
-                                    .expect("window is focused by pointer");
-                                let scale = window.primary_output_scale();
-                                state.cursor.set_icon(
-                                    &wl_pointer,
-                                    serial.as_raw(),
-                                    cursor_style_to_icon_names(default_style),
-                                    scale,
-                                );
-                            }
+                            let wl_pointer = state
+                                .wl_pointer
+                                .clone()
+                                .expect("window is focused by pointer");
+                            state.show_cursor_style(
+                                &wl_pointer,
+                                serial.as_raw(),
+                                default_style,
+                                &window,
+                            );
                         }
                     }
                     if state

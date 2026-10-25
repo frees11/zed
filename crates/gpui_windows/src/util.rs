@@ -90,6 +90,7 @@ pub(crate) fn windows_credentials_target_name(url: &str) -> String {
     format!("zed:url={}", url)
 }
 
+/// The cursor of `style`; `CursorStyle::None` has none, so the window hides the cursor.
 pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     static ARROW: OnceLock<SafeCursor> = OnceLock::new();
     static IBEAM: OnceLock<SafeCursor> = OnceLock::new();
@@ -101,6 +102,7 @@ pub(crate) fn load_cursor(style: CursorStyle) -> Option<HCURSOR> {
     static SIZENESW: OnceLock<SafeCursor> = OnceLock::new();
     static NO: OnceLock<SafeCursor> = OnceLock::new();
     let (lock, name) = match style {
+        CursorStyle::None => return None,
         CursorStyle::IBeam | CursorStyle::IBeamCursorForVerticalLayout => (&IBEAM, IDC_IBEAM),
         CursorStyle::Crosshair => (&CROSS, IDC_CROSS),
         CursorStyle::PointingHand | CursorStyle::DragLink => (&HAND, IDC_HAND),
@@ -188,4 +190,25 @@ where
             .log_err();
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::load_cursor;
+    use gpui::CursorStyle;
+
+    #[test]
+    fn the_hidden_cursor_has_no_cursor_handle() {
+        assert_eq!(load_cursor(CursorStyle::None), None);
+        for style in [
+            CursorStyle::Arrow,
+            CursorStyle::IBeam,
+            CursorStyle::PointingHand,
+        ] {
+            assert!(
+                load_cursor(style).is_some_and(|cursor| !cursor.is_invalid()),
+                "{style:?}"
+            );
+        }
+    }
 }

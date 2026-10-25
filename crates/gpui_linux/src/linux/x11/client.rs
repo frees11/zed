@@ -2087,14 +2087,18 @@ impl X11ClientState {
             .expect("Failed to initialize window refresh timer")
     }
 
+    /// The cursor that shows `style`; `CursorStyle::None` gets the invisible cursor, so the
+    /// pointer stays hidden over the window until another style is set.
     fn get_cursor_icon(&mut self, style: CursorStyle) -> Option<xproto::Cursor> {
+        let Some(cursor_icon_names) = cursor_style_to_icon_names(style) else {
+            return self.get_or_create_invisible_cursor();
+        };
         if let Some(cursor) = self.cursor_cache.get(&style) {
             return *cursor;
         }
 
         let result = 'outer: {
             let mut errors = String::new();
-            let cursor_icon_names = cursor_style_to_icon_names(style);
             for cursor_icon_name in cursor_icon_names {
                 match self
                     .cursor_handle

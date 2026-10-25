@@ -1317,11 +1317,14 @@ pub(super) fn read_fd_with_timeout(
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(super) const DEFAULT_CURSOR_ICON_NAME: &str = "left_ptr";
 
+/// The theme icons that show `style`, best first; none for `CursorStyle::None`, which hides the
+/// cursor instead.
 #[cfg(any(feature = "wayland", feature = "x11"))]
-pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'static str] {
+pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> Option<&'static [&'static str]> {
     // Based on cursor names from chromium:
     // https://github.com/chromium/chromium/blob/d3069cf9c973dc3627fa75f64085c6a86c8f41bf/ui/base/cursor/cursor_factory.cc#L113
-    match style {
+    Some(match style {
+        CursorStyle::None => return None,
         CursorStyle::Arrow => &[DEFAULT_CURSOR_ICON_NAME],
         CursorStyle::IBeam => &["text", "xterm"],
         CursorStyle::Crosshair => &["crosshair", "cross"],
@@ -1343,7 +1346,7 @@ pub(super) fn cursor_style_to_icon_names(style: CursorStyle) -> &'static [&'stat
         CursorStyle::DragLink => &["alias"],
         CursorStyle::DragCopy => &["copy"],
         CursorStyle::ContextualMenu => &["context-menu"],
-    }
+    })
 }
 
 #[cfg(any(feature = "wayland", feature = "x11"))]
@@ -1713,6 +1716,27 @@ async fn await_idle_sleep_prevention(
 mod tests {
     use super::*;
     use gpui::{Point, px};
+
+    #[cfg(any(feature = "wayland", feature = "x11"))]
+    #[test]
+    fn only_the_hidden_cursor_has_no_icon() {
+        assert_eq!(cursor_style_to_icon_names(CursorStyle::None), None);
+        for style in [
+            CursorStyle::Arrow,
+            CursorStyle::IBeam,
+            CursorStyle::PointingHand,
+            CursorStyle::ContextualMenu,
+        ] {
+            assert!(
+                cursor_style_to_icon_names(style).is_some_and(|names| !names.is_empty()),
+                "{style:?}"
+            );
+        }
+        assert_eq!(
+            cursor_style_to_icon_names(CursorStyle::Arrow),
+            Some(&[DEFAULT_CURSOR_ICON_NAME][..])
+        );
+    }
 
     #[cfg(any(feature = "wayland", feature = "x11"))]
     #[test]
