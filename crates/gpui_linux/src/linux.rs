@@ -3,6 +3,8 @@ mod display_connection;
 mod headless;
 mod keyboard;
 mod platform;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+mod present_feedback;
 mod system_notifications;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 mod text_system;
@@ -19,6 +21,8 @@ pub(crate) use display_connection::{Backend, DisplayConnection, select_backend};
 pub(crate) use headless::*;
 pub(crate) use keyboard::*;
 pub(crate) use platform::*;
+#[cfg(any(feature = "wayland", feature = "x11"))]
+pub(crate) use present_feedback::*;
 #[cfg(any(feature = "wayland", feature = "x11"))]
 pub(crate) use text_system::*;
 #[cfg(feature = "wayland")]

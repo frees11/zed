@@ -1038,6 +1038,39 @@ pub struct RequestFrameOptions {
     pub signal_source: FrameRequestSource,
 }
 
+/// What a platform window learned about one of its [`PlatformWindow::draw`] calls: whether and
+/// when the frame it drew reached the screen.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub struct PlatformPresentFeedback {
+    /// The 1-based number of the window's `draw` call this feedback is about.
+    pub draw_call: u64,
+    /// When the backend was handed the frame, right before it rendered and presented it. A
+    /// compositor that shows frames at once can show one before the present call returns, so
+    /// this is the latest time that is never after the frame was shown.
+    pub submitted: Instant,
+    /// Whether and when the frame was shown.
+    pub outcome: PresentOutcome,
+}
+
+/// Whether and when a drawn frame was shown.
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum PresentOutcome {
+    /// The frame was shown.
+    Presented {
+        /// When the frame first lit up, moved from the backend's clock onto [`Instant`].
+        at: Instant,
+        /// The output's refresh interval, when the backend reports one.
+        refresh: Option<Duration>,
+        /// The output's refresh counter at that present, when the backend reports one.
+        sequence: Option<u64>,
+    },
+    /// The system dropped the frame without showing it, for example because a newer frame
+    /// replaced it.
+    Discarded,
+    /// The backend cannot tell: the draw did not present, or its present could not be timed.
+    Unknown,
+}
+
 /// Preserves the first platform frame request time across coalesced notifications.
 ///
 /// Producers may record from a platform thread without waiting for the UI thread.
@@ -1289,6 +1322,15 @@ pub trait PlatformWindow: HasWindowHandle + HasDisplayHandle {
     fn on_appearance_changed(&self, callback: Box<dyn FnMut()>);
     fn on_button_layout_changed(&self, _callback: Box<dyn FnMut()>) {}
     fn draw(&self, scene: &Scene);
+    /// Registers the callback that receives a [`PlatformPresentFeedback`] for each later
+    /// [`Self::draw`] call, and returns whether this backend reports any; a backend that returns
+    /// `false` never calls it.
+    ///
+    /// The callback runs on the main thread, possibly during a draw, so it must not borrow the
+    /// app. Feedback may arrive in another order than the draws.
+    fn on_present_feedback(&self, _callback: Box<dyn FnMut(PlatformPresentFeedback)>) -> bool {
+        false
+    }
     fn schedule_frame(&self) {}
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas>;
     fn is_subpixel_rendering_supported(&self) -> bool;

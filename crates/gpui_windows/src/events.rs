@@ -1378,6 +1378,7 @@ impl WindowsWindowInner {
             (None, FrameRequestSource::NativeCallback),
             |(at, source)| (Some(at), source),
         );
+        self.deliver_present_feedback();
         request_frame(RequestFrameOptions {
             require_presentation: false,
             force_render,
@@ -1390,6 +1391,21 @@ impl WindowsWindowInner {
         unsafe { ValidateRect(Some(handle), None).ok().log_err() };
 
         Some(0)
+    }
+
+    /// Forwards the present feedback known at this vsync, before the next frame is drawn.
+    fn deliver_present_feedback(&self) {
+        let feedback = self.state.renderer.borrow_mut().take_present_feedback();
+        if feedback.is_empty() {
+            return;
+        }
+        let Some(mut callback) = self.state.callbacks.present_feedback.take() else {
+            return;
+        };
+        for feedback in feedback {
+            callback(feedback);
+        }
+        self.state.callbacks.present_feedback.set(Some(callback));
     }
 
     #[inline]

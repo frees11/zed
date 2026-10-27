@@ -3,7 +3,7 @@
 Remote Ultra builds on GPUI from this fork of zed.
 
 - `ru/base` is the exact upstream pin `9f305aaf88370e8ca39c702242186e3d8f97ecca` (`gpui_macos: Handle null open and save panels (#66042)`).
-- `ru/patches` is `ru/base` plus one commit per patch, subject `[ru-Fn] <crate>[, <crate>]...: <what>`, followed by this file as its own `[ru]` housekeeping commit. F1 to F6 and F10 started as a `cherry-pick -x` of the branch they were developed on, so their message names that source commit; the fixes of the adversarial review of 2026-10-25 are folded into each patch. F8 was written on `ru/patches`.
+- `ru/patches` is `ru/base` plus one commit per patch, subject `[ru-Fn] <crate>[, <crate>]...: <what>`, followed by this file as its own `[ru]` housekeeping commit. F1 to F6 and F10 started as a `cherry-pick -x` of the branch they were developed on, so their message names that source commit; the fixes of the adversarial review of 2026-10-25 are folded into each patch. F8 was written on `ru/patches`. F14 was written on `ru/f14` on top of the `[ru]` commit of `ru-20261025-1`, and its commit adds its section here.
 - Tags `ru-YYYYMMDD-n` mark the `ru/patches` commits the Remote Ultra workspace pins.
 - `tools/check-zed-patches.sh [--target <target>]... <zed-tree>` in the Remote Ultra repository checks every crate the patches touch on macOS, `aarch64-apple-ios-sim`, `aarch64-apple-ios`, `x86_64-pc-windows-gnu` and `aarch64-linux-android` (dev and release), then runs each patch commit's `Ru-Test: <host|x86_64-pc-windows-gnu|linux> <cargo test args>` trailers: `x86_64-pc-windows-gnu` under wine64, `linux` in the Linux dev container of `tools/linux/docker.sh` (llvmpipe/lavapipe Vulkan). `[ru]` commits are not built or tested, and the check fails when one changes anything but this file. `--target` limits both phases, for example to clean the target directory between targets. `tools/zed-rebase.sh` moves the patches to a new upstream pin and carries the `[ru]` commits along; when upstream has merged (or `--drop` names) every patch, it finishes with only them.
 
@@ -31,6 +31,7 @@ from this tree inside the Remote Ultra checkout; the container has no `lld`, whi
 | F6 | gpui_ios | not upstream; draft PR candidate |
 | F8 | gpui, gpui_linux (+ the variant's arms in gpui_macos, gpui_windows, gpui_web) | not upstream; reverts the removal of `CursorStyle::None` in #55664 with persistent hiding; fork only |
 | F10 | gpui_ios | not upstream; fork only |
+| F14 | gpui, gpui_linux, gpui_windows | not upstream; draft PR candidate |
 
 Draft PRs are opened only with the owner's approval and a signed CLA.
 
@@ -186,3 +187,46 @@ Tests (`gpui_ios::frame_rate::tests`, run on the macOS host): `promotion_screens
 - Plan acceptance: logged display link interval p50 <= 8.6 ms on a ProMotion device.
 
 Upstream: not upstream. Fork only; it is not in the plan's list of draft PRs.
+
+## F14 gpui, gpui_linux, gpui_windows: report when each drawn frame reached the screen
+
+A backend that implements `PlatformWindow::on_present_feedback` (the default returns `false`) reports one `PlatformPresentFeedback { draw_call, submitted, outcome }` per later `draw` call, with `PresentOutcome::Presented { at, refresh, sequence }`, `Discarded` or `Unknown` (the draw did not present, or its present could not be timed). `submitted` is taken right before the backend renders and presents the frame: headless sway showed frames up to 28 µs before the present call returned. `Window::draw_id()` names the draw that paints now, or the last one. `Window::on_frame_presented` forwards the feedback of the first present of each draw as `FramePresented { draw, submitted, outcome }` and returns `None` when the platform reports nothing; it asks the platform on its first call. A present of the same scene again and a draw that a newer one replaced before any present get no feedback; at most 16 presented draws wait for theirs. Callbacks run on the main thread, possibly during a draw, so they must not borrow the app. `TestWindow` reports every draw as presented at once; `set_present_feedback_supported` and `simulate_present_feedback` drive tests. Only observation: no pacing, present mode or frame latency changes (F9 keeps those, the waitable swap chain included).
+
+- gpui_windows: after each successful `Present` the renderer reads `GetLastPresentCount`. `draw_window` samples `GetFrameStatistics` once per vsync tick, after the vsync thread's `DwmFlush` and before the next frame: the pending present whose ID equals `PresentCount` is `Presented` at `SyncQPCTime` moved back by `SyncRefreshCount - PresentRefreshCount` refreshes (the `DwmGetCompositionTimingInfo` interval read when feedback is enabled), with `sequence = PresentRefreshCount`; older pending presents are `Unknown`, because a newer one overtook them before a sample saw them. Disjoint statistics keep presents pending for at most 1 s. Times in the future or older than 1 s are rejected. A draw that does not present (the skip after a device loss, a render or present error) is `Unknown`; a new swap chain after a device loss and `ResizeBuffers` end every pending present as `Unknown`.
+- gpui_linux Wayland: `wp_presentation` (version 1 or 2) is bound when the compositor has it. With feedback enabled each draw requests `wp_presentation.feedback` next to its frame callback, before wgpu commits. `presented` gives `Presented` (the compositor's `clock_id` clock moved onto `Instant`; `refresh` and `sequence` zero mean none) and `discarded` gives `Discarded`. A draw that did not present is `Unknown` at once, and the answer to its request, which the next commit without new content gets, is dropped. Without `wp_presentation`, `on_present_feedback` returns `false`.
+- gpui_linux X11: x11rb feature `present` (no new crate). With Present 1.2 every window selects `CompleteNotify` under its own event id right after it is created, so pixmap completions pair with its presents oldest first. `SKIP` gives `Discarded`; `COPY`, `FLIP` and `SUBOPTIMAL_COPY` give `Presented` at `ust` (the server's CLOCK_MONOTONIC in µs) with `sequence = msc`; `NOTIFY_MSC` events are ignored. When 8 presents wait for events the window reports them `Unknown` and stops expecting events, for a WSI that does not present with `PresentPixmap`.
+- Limits: under an X11 compositing manager the time is the server's copy into the window, not light on screen. A remote X server or another compositor clock fails the 1 s bound and gives `Unknown`. X11 pairing assumes one `PresentPixmap` per present wgpu reports. DXGI frame statistics need a flip model swap chain (both of gpui_windows's are flip sequential), and Microsoft calls them unreliable on many multi-monitor setups.
+
+Files:
+- `crates/gpui/src/platform.rs`
+- `crates/gpui/src/platform/test/window.rs`
+- `crates/gpui/src/window.rs`
+- `crates/gpui_linux/Cargo.toml` (x11rb feature `present`)
+- `crates/gpui_linux/src/linux.rs`
+- `crates/gpui_linux/src/linux/present_feedback.rs` (new)
+- `crates/gpui_linux/src/linux/wayland/client.rs`
+- `crates/gpui_linux/src/linux/wayland/window.rs`
+- `crates/gpui_linux/src/linux/x11/client.rs`
+- `crates/gpui_linux/src/linux/x11/window.rs`
+- `crates/gpui_windows/src/directx_devices.rs` (test-only `DirectXDevices::warp`)
+- `crates/gpui_windows/src/directx_renderer.rs`
+- `crates/gpui_windows/src/events.rs`
+- `crates/gpui_windows/src/gpui_windows.rs`
+- `crates/gpui_windows/src/present_feedback.rs` (new)
+- `crates/gpui_windows/src/vsync.rs`
+- `crates/gpui_windows/src/window.rs`
+
+Tests:
+- `gpui::window::present_feedback_tests` (macOS host): `a_presented_draw_reaches_the_subscriber_once_with_its_draw_id`, `a_re_present_of_the_same_draw_is_not_reported_again`, `a_draw_replaced_before_any_present_gets_no_feedback`, `feedback_for_an_unknown_draw_call_is_dropped`, `a_platform_without_feedback_gives_no_subscription`, `late_feedback_reaches_the_draw_of_its_draw_call`.
+- `gpui_windows::present_feedback::tests` (wine64): `a_present_is_reported_when_its_count_is_the_latest_presented`, `the_vsync_time_moves_back_by_the_refreshes_between_present_and_sync`, `a_vsync_behind_the_sync_without_a_refresh_interval_is_unknown`, `presents_overtaken_by_a_newer_one_are_unknown`, `disjoint_statistics_keep_presents_pending`, `presents_pending_for_more_than_a_second_are_unknown`, `a_draw_without_a_present_is_unknown_at_once`, `qpc_times_in_the_future_or_older_than_a_second_are_rejected`, `present_counts_wrap_around`, `a_new_swap_chain_ends_every_pending_present_as_unknown`.
+- `gpui_linux::linux::present_feedback::tests` (Linux dev container): `presented_times_move_from_the_presentation_clock_to_an_instant`, `stamps_in_the_future_or_older_than_a_second_are_rejected`, `discarded_feedback_reports_discarded`, `a_voided_ticket_reports_nothing_later`, `the_hi_and_lo_halves_join_into_seconds_and_sequence`, `complete_notifies_pop_the_oldest_draw`, `skipped_pixmaps_are_discarded`, `notify_msc_events_are_ignored`, `eight_presents_without_events_stop_the_expectation`.
+- Commands (`Ru-Test` trailers): `host -p gpui --features gpui_platform/runtime_shaders --lib -- window::present_feedback_tests`, `x86_64-pc-windows-gnu -p gpui_windows --features test-support --lib -- present_feedback::tests`, `linux -p gpui_linux --lib -- present_feedback::tests`.
+- WARP, `#[ignore = "hw"]` because wine has no WARP device: `present_feedback::tests::warp_presents_report_a_time_after_submit` draws 120 frames paced by `DwmFlush` into a small `WS_POPUP` window on WARP, with and without DirectComposition, and checks that every draw gets feedback, at least 90 % are presented, every present time is at or after its submit and within 250 ms, and present times increase. `probe.cmd` runs it with the other ignored `gpui_windows` tests. Not run yet: it needs a Windows machine.
+- Display servers, `#[ignore = "compositor"]`, one per process, from this tree inside the Remote Ultra checkout:
+  `tools/linux/docker.sh tools/linux/headless-session.sh env -u DISPLAY RUSTUP_TOOLCHAIN=1.99.0 CARGO_TARGET_DIR=/target/f14 CARGO_INCREMENTAL=0 CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=bfd" cargo test --locked -p gpui_linux --lib -- --ignored --nocapture present_feedback::session::wayland_`
+  and the same with `env -u WAYLAND_DISPLAY` and `present_feedback::session::x11_`. Each opens a 64×64 window through `LinuxPlatform`, renders 120 frames of a moving quad and checks the feedback.
+  - `wayland_presents_report_a_time_after_submit`: at least 108 frames presented, each at or after its submit and within 250 ms, in increasing order. On 2026-10-27 in headless sway (pixman) with wgpu on lavapipe (Mesa 25.2.8, arm64): 117 of 119 reports presented, submit to present median 38 ms, longest 154 ms.
+  - `x11_presents_report_a_time_after_submit_or_stop_expecting_them`: at least 108 frames get feedback, and either the presented ones pass the Wayland checks or every frame is `Unknown` because the window stopped expecting events. On 2026-10-27 under Xvfb with lavapipe, no pixmap `CompleteNotify` arrived (lavapipe without DRI3 presents without `PresentPixmap`; a `NotifyMSC` sent in a manual check reached the window's selection as a `NOTIFY_MSC` `CompleteNotify`), so the window stopped expecting events and X11 frames there have no present time.
+- `check-zed-patches.sh` runs `cargo test` without a display server, so the matrix does not run the two session tests.
+
+Upstream: not upstream. Draft PR candidate.

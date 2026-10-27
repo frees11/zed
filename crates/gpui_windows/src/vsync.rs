@@ -12,7 +12,7 @@ use windows::Win32::{
     System::Performance::QueryPerformanceFrequency,
 };
 
-static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
+pub(crate) static QPC_TICKS_PER_SECOND: LazyLock<u64> = LazyLock::new(|| {
     let mut frequency = 0;
     // On systems that run Windows XP or later, the function will always succeed and
     // will thus never return zero.
@@ -59,7 +59,7 @@ impl VSyncProvider {
     }
 }
 
-fn get_dwm_interval() -> Result<Duration> {
+pub(crate) fn get_dwm_interval() -> Result<Duration> {
     let mut timing_info = DWM_TIMING_INFO {
         cbSize: std::mem::size_of::<DWM_TIMING_INFO>() as u32,
         ..Default::default()

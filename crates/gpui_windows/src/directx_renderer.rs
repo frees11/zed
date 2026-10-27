@@ -1,6 +1,7 @@
 use std::{
     slice,
     sync::{Arc, OnceLock},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
@@ -58,6 +59,12 @@ pub(crate) struct DirectXRenderer {
     /// meaning we lost all the allocated gpu textures and scene resources.
     skip_draws: bool,
     external_surfaces: Option<ExternalSurfaces>,
+    /// How many times [`Self::draw`] was called.
+    draw_calls: u64,
+    /// Set once the window asked for present feedback.
+    present_tracker: Option<PresentTracker>,
+    /// The vsync interval when present feedback was enabled.
+    present_refresh: Option<Duration>,
 }
 
 /// Direct3D objects
@@ -201,6 +208,9 @@ impl DirectXRenderer {
             height: 1,
             skip_draws: false,
             external_surfaces: Some(external_surfaces),
+            draw_calls: 0,
+            present_tracker: None,
+            present_refresh: None,
         })
     }
 
@@ -335,10 +345,44 @@ impl DirectXRenderer {
         self.external_surfaces = Some(external_surfaces);
         self.direct_composition = direct_composition;
         self.skip_draws = true;
+        if let Some(present_tracker) = &mut self.present_tracker {
+            present_tracker.reset();
+        }
         Ok(())
     }
 
     pub(crate) fn draw(
+        &mut self,
+        scene: &Scene,
+        background_appearance: WindowBackgroundAppearance,
+    ) -> Result<()> {
+        self.draw_calls += 1;
+        let presents = !self.skip_draws;
+        let submitted = Instant::now();
+        let result = self.render_and_present(scene, background_appearance);
+        if self.present_tracker.is_some() {
+            let present_count = if presents && result.is_ok() {
+                self.resources.as_ref().and_then(|resources| {
+                    unsafe { resources.swap_chain.GetLastPresentCount() }
+                        .context("Reading the swap chain's last present count")
+                        .log_err()
+                })
+            } else {
+                None
+            };
+            if let Some(present_tracker) = &mut self.present_tracker {
+                match present_count {
+                    Some(present_count) => {
+                        present_tracker.submitted(self.draw_calls, present_count, submitted)
+                    }
+                    None => present_tracker.not_presented(self.draw_calls, submitted),
+                }
+            }
+        }
+        result
+    }
+
+    fn render_and_present(
         &mut self,
         scene: &Scene,
         background_appearance: WindowBackgroundAppearance,
@@ -350,6 +394,45 @@ impl DirectXRenderer {
         }
         self.render(scene, background_appearance)?;
         self.present()
+    }
+
+    /// Starts tracking when each later draw reached the screen.
+    pub(crate) fn enable_present_feedback(&mut self) {
+        if self.present_tracker.is_none() {
+            self.present_tracker = Some(PresentTracker::default());
+            self.present_refresh = get_dwm_interval()
+                .context("Reading the vsync interval for present feedback")
+                .log_err();
+        }
+    }
+
+    /// Samples the swap chain's frame statistics and returns the present feedback that is
+    /// known now. Called once per vsync, after the vsync thread's `DwmFlush`, which updates the
+    /// statistics on systems with a hardware flip queue.
+    pub(crate) fn take_present_feedback(&mut self) -> Vec<PlatformPresentFeedback> {
+        let Some(present_tracker) = &mut self.present_tracker else {
+            return Vec::new();
+        };
+        if present_tracker.has_pending()
+            && let Some(resources) = &self.resources
+            && let Some(clock) = QpcClock::now()
+                .context("Reading the performance counter for present feedback")
+                .log_err()
+        {
+            let mut statistics = DXGI_FRAME_STATISTICS::default();
+            let statistics =
+                match unsafe { resources.swap_chain.GetFrameStatistics(&mut statistics) } {
+                    Ok(()) => Some(FrameStatistics::from(statistics)),
+                    Err(error) => {
+                        if error.code() != DXGI_ERROR_FRAME_STATISTICS_DISJOINT {
+                            log::trace!("no frame statistics for present feedback: {error}");
+                        }
+                        None
+                    }
+                };
+            present_tracker.sample(statistics, clock, self.present_refresh);
+        }
+        present_tracker.take_ready()
     }
 
     /// Clear the render target for `background_appearance` and encode every
@@ -466,6 +549,9 @@ impl DirectXRenderer {
         let resources = self.resources.as_mut().context("resources missing")?;
         resources.render_target.take();
         resources.render_target_view.take();
+        if let Some(present_tracker) = &mut self.present_tracker {
+            present_tracker.reset();
+        }
 
         // Resizing the swap chain requires a call to the underlying DXGI adapter, which can return the device removed error.
         // The app might have moved to a monitor that's attached to a different graphics device.

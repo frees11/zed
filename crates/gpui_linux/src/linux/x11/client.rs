@@ -31,7 +31,7 @@ use x11rb::{
         AtomEnum, ChangeWindowAttributesAux, ClientMessageData, ClientMessageEvent,
         ConnectionExt as _, EventMask, Visibility,
     },
-    protocol::{Event, dri3, randr, render, xinput, xkb, xproto},
+    protocol::{Event, dri3, present, randr, render, xinput, xkb, xproto},
     resource_manager::Database,
     wrapper::ConnectionExt as _,
     xcb_ffi::XCBConnection,
@@ -234,6 +234,8 @@ pub struct X11ClientState {
     pointer_device_states: BTreeMap<xinput::DeviceId, PointerDeviceState>,
 
     pub(crate) supports_xinput_gestures: bool,
+    /// Whether the server has the Present extension, whose `CompleteNotify` events time presents.
+    supports_present: bool,
 
     pub(crate) common: Rc<RefCell<LinuxCommon>>,
     pub(crate) clipboard: Clipboard,
@@ -385,6 +387,7 @@ impl X11Connection {
         xcb_connection.prefetch_extension_information(randr::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(render::X11_EXTENSION_NAME)?;
         xcb_connection.prefetch_extension_information(xinput::X11_EXTENSION_NAME)?;
+        xcb_connection.prefetch_extension_information(present::X11_EXTENSION_NAME)?;
 
         // Announce to X server that XInput up to 2.4 is supported.
         // Version 2.4 is needed for gesture events (GesturePinchBegin/Update/End).
@@ -406,6 +409,8 @@ impl X11Connection {
             xinput_version.minor_version,
             supports_xinput_gestures,
         );
+
+        let supports_present = supports_present(&xcb_connection);
 
         let pointer_device_states =
             current_pointer_device_states(&xcb_connection, &BTreeMap::new()).unwrap_or_default();
@@ -550,6 +555,7 @@ impl X11Connection {
                 pointer_device_states,
 
                 supports_xinput_gestures,
+                supports_present,
 
                 clipboard,
                 clipboard_item: None,
@@ -1503,6 +1509,10 @@ impl X11Client {
                     phase: gpui::TouchPhase::Ended,
                 }));
             }
+            Event::PresentCompleteNotify(event) => {
+                let window = self.get_window(event.window)?;
+                window.present_completed(&event);
+            }
             _ => {}
         };
 
@@ -1748,6 +1758,14 @@ impl X11Client {
             last_visibility: Visibility::UNOBSCURED,
             is_mapped: false,
         };
+
+        if state.supports_present {
+            window
+                .0
+                .listen_for_present_completion()
+                .context("X11: selecting Present events")
+                .log_err();
+        }
 
         state.windows.insert(x_window, window_ref);
         Ok(Box::new(window))
@@ -2275,6 +2293,24 @@ fn detect_compositor_gpu(
     let metadata = std::fs::metadata(&path).ok()?;
 
     crate::linux::compositor_gpu_hint_from_dev_t(metadata.rdev())
+}
+
+/// Whether the server has the Present extension at version 1.2 or later.
+fn supports_present(xcb_connection: &XCBConnection) -> bool {
+    use present::ConnectionExt as _;
+
+    let has_extension = xcb_connection
+        .extension_information(present::X11_EXTENSION_NAME)
+        .ok()
+        .flatten()
+        .is_some();
+    has_extension
+        && get_reply(
+            || "Present QueryVersion failed",
+            xcb_connection.present_query_version(1, 2),
+        )
+        .log_err()
+        .is_some_and(|version| (version.major_version, version.minor_version) >= (1, 2))
 }
 
 fn check_compositor_present(xcb_connection: &XCBConnection, root: xproto::Window) -> bool {

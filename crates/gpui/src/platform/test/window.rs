@@ -1,16 +1,17 @@
 use crate::{
     AnyWindowHandle, Bounds, DevicePixels, DispatchEventResult, DisplayId, GpuSpecs, HeadlessAtlas,
     Pixels, PlatformAtlas, PlatformDisplay, PlatformHeadlessRenderer, PlatformInput,
-    PlatformInputHandler, PlatformWindow, Point, PromptButton, RequestFrameOptions, Scene, Size,
-    TestDisplay, TestPlatform, TextInputConfiguration, TextInputStateChange, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowInsets, WindowParams,
-    WindowVisibility,
+    PlatformInputHandler, PlatformPresentFeedback, PlatformWindow, Point, PresentOutcome,
+    PromptButton, RequestFrameOptions, Scene, Size, TestDisplay, TestPlatform,
+    TextInputConfiguration, TextInputStateChange, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowInsets, WindowParams, WindowVisibility,
 };
 use gpui_util::ResultExt as _;
 #[cfg(any(test, feature = "test-support"))]
 use image::RgbaImage;
 use parking_lot::Mutex;
 use raw_window_handle::{HasDisplayHandle, HasWindowHandle};
+use scheduler::Instant;
 use std::{
     cell::Cell,
     path::PathBuf,
@@ -47,6 +48,9 @@ pub(crate) struct TestWindowState {
     display_changed_callback: Option<Box<dyn FnMut()>>,
     appearance_change_callback: Option<Box<dyn FnMut()>>,
     request_frame_callback: Option<Box<dyn FnMut(RequestFrameOptions)>>,
+    present_feedback_supported: bool,
+    present_feedback_callback: Option<Box<dyn FnMut(PlatformPresentFeedback)>>,
+    draw_calls: u64,
     frame_wake_count: Rc<Cell<usize>>,
     frame_scheduled: bool,
     frame_callback_pending: bool,
@@ -121,6 +125,9 @@ impl TestWindow {
             display_changed_callback: None,
             appearance_change_callback: None,
             request_frame_callback: None,
+            present_feedback_supported: true,
+            present_feedback_callback: None,
+            draw_calls: 0,
             frame_wake_count: Rc::new(Cell::new(0)),
             frame_scheduled: false,
             frame_callback_pending: false,
@@ -283,6 +290,21 @@ impl TestWindow {
         drop(lock);
         callback(options);
         self.0.lock().request_frame_callback = Some(callback);
+    }
+
+    /// Makes the window report no present feedback, as a platform without it does. Takes effect
+    /// for registrations after this call.
+    pub fn set_present_feedback_supported(&self, supported: bool) {
+        self.0.lock().present_feedback_supported = supported;
+    }
+
+    /// Delivers `feedback` to the window's present feedback callback, as a backend would.
+    pub fn simulate_present_feedback(&self, feedback: PlatformPresentFeedback) {
+        let Some(mut callback) = self.0.lock().present_feedback_callback.take() else {
+            return;
+        };
+        callback(feedback);
+        self.0.lock().present_feedback_callback = Some(callback);
     }
 
     pub fn simulate_input(&mut self, event: PlatformInput) -> bool {
@@ -549,10 +571,31 @@ impl PlatformWindow for TestWindow {
         let mut state = self.0.lock();
         state.frame_callback_pending = true;
         state.frame_scheduled = true;
+        state.draw_calls += 1;
+        let draw_call = state.draw_calls;
+        let submitted = Instant::now();
         let device_size: Size<DevicePixels> = state.bounds.size.to_device_pixels(scale_factor);
         if let Some(renderer) = &mut state.renderer {
             renderer.render_scene(scene, device_size).warn_on_err();
         }
+        drop(state);
+        self.simulate_present_feedback(PlatformPresentFeedback {
+            draw_call,
+            submitted,
+            outcome: PresentOutcome::Presented {
+                at: Instant::now(),
+                refresh: None,
+                sequence: None,
+            },
+        });
+    }
+
+    fn on_present_feedback(&self, callback: Box<dyn FnMut(PlatformPresentFeedback)>) -> bool {
+        let mut state = self.0.lock();
+        if state.present_feedback_supported {
+            state.present_feedback_callback = Some(callback);
+        }
+        state.present_feedback_supported
     }
 
     fn sprite_atlas(&self) -> sync::Arc<dyn crate::PlatformAtlas> {

@@ -72,6 +72,25 @@ impl DirectXDevices {
     }
 }
 
+#[cfg(test)]
+impl DirectXDevices {
+    /// The devices of WARP, the software rasterizer every Windows 10+ install carries.
+    pub(crate) fn warp() -> Result<Self> {
+        let dxgi_factory = get_dxgi_factory(false).context("Creating DXGI factory")?;
+        let adapter: IDXGIAdapter1 =
+            unsafe { dxgi_factory.EnumWarpAdapter() }.context("Getting the WARP adapter")?;
+        let mut device_context = None;
+        let device = get_device(&adapter, Some(&mut device_context), None, false)
+            .context("Creating the WARP device")?;
+        Ok(Self {
+            adapter,
+            dxgi_factory,
+            device,
+            device_context: device_context.context("the WARP device has no context")?,
+        })
+    }
+}
+
 #[inline]
 fn check_debug_layer_available() -> bool {
     #[cfg(debug_assertions)]

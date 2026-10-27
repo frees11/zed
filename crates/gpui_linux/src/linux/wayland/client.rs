@@ -1,5 +1,5 @@
 use std::{
-    cell::{RefCell, RefMut},
+    cell::{Cell, RefCell, RefMut},
     hash::Hash,
     os::{
         fd::{AsRawFd, BorrowedFd, FromRawFd as _, RawFd},
@@ -44,6 +44,7 @@ use wayland_client::{
 use wayland_protocols::wp::pointer_gestures::zv1::client::{
     zwp_pointer_gesture_pinch_v1, zwp_pointer_gestures_v1,
 };
+use wayland_protocols::wp::presentation_time::client::{wp_presentation, wp_presentation_feedback};
 use wayland_protocols::wp::primary_selection::zv1::client::zwp_primary_selection_offer_v1::{
     self, ZwpPrimarySelectionOfferV1,
 };
@@ -249,6 +250,9 @@ pub struct Globals {
     pub shm: wl_shm::WlShm,
     pub seat: wl_seat::WlSeat,
     pub viewporter: Option<wp_viewporter::WpViewporter>,
+    pub presentation: Option<wp_presentation::WpPresentation>,
+    /// The clock of `presentation`'s timestamps, once the compositor named it.
+    pub presentation_clock: Rc<Cell<Option<libc::clockid_t>>>,
     pub fractional_scale_manager:
         Option<wp_fractional_scale_manager_v1::WpFractionalScaleManagerV1>,
     pub decoration_manager: Option<zxdg_decoration_manager_v1::ZxdgDecorationManagerV1>,
@@ -300,6 +304,8 @@ impl Globals {
                 .bind(&qh, 1..=6, ())
                 .context("Wayland compositor does not provide xdg_wm_base")?,
             viewporter: globals.bind(&qh, 1..=1, ()).ok(),
+            presentation: globals.bind(&qh, 1..=2, ()).ok(),
+            presentation_clock: Rc::new(Cell::new(None)),
             fractional_scale_manager: globals.bind(&qh, 1..=1, ()).ok(),
             decoration_manager: globals.bind(&qh, 1..=1, ()).ok(),
             layer_shell: globals.bind(&qh, 1..=5, ()).ok(),
@@ -1701,6 +1707,54 @@ impl Dispatch<WlCallback, ObjectId> for WaylandClientStatePtr {
                 frame_callback_signal_at(callback_data)
             }));
         }
+    }
+}
+
+impl Dispatch<wp_presentation::WpPresentation, ()> for WaylandClientStatePtr {
+    fn event(
+        state: &mut WaylandClientStatePtr,
+        _: &wp_presentation::WpPresentation,
+        event: wp_presentation::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wp_presentation::Event::ClockId { clk_id } = event {
+            state
+                .get_client()
+                .borrow()
+                .globals
+                .presentation_clock
+                .set(libc::clockid_t::try_from(clk_id).ok());
+        }
+    }
+}
+
+/// Names the draw a `wp_presentation_feedback` was requested for.
+pub(crate) struct PresentTicket {
+    pub(crate) surface_id: ObjectId,
+    pub(crate) draw_call: u64,
+}
+
+impl Dispatch<wp_presentation_feedback::WpPresentationFeedback, PresentTicket>
+    for WaylandClientStatePtr
+{
+    fn event(
+        state: &mut WaylandClientStatePtr,
+        _: &wp_presentation_feedback::WpPresentationFeedback,
+        event: wp_presentation_feedback::Event,
+        ticket: &PresentTicket,
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        let client = state.get_client();
+        let mut state = client.borrow_mut();
+        let Some(window) = get_window(&mut state, &ticket.surface_id) else {
+            return;
+        };
+        let clock_id = state.globals.presentation_clock.get();
+        drop(state);
+        window.presentation_feedback_received(ticket.draw_call, event, clock_id);
     }
 }
 

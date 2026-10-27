@@ -18,6 +18,7 @@ use wayland_client::{
     Proxy,
     protocol::{wl_callback, wl_output, wl_seat, wl_surface},
 };
+use wayland_protocols::wp::presentation_time::client::wp_presentation_feedback;
 use wayland_protocols::wp::viewporter::client::wp_viewport;
 use wayland_protocols::xdg::decoration::zv1::client::zxdg_toplevel_decoration_v1;
 use wayland_protocols::xdg::shell::client::xdg_popup;
@@ -32,14 +33,17 @@ use wayland_protocols_plasma::blur::client::org_kde_kwin_blur;
 use wayland_protocols_wlr::layer_shell::v1::client::zwlr_layer_surface_v1;
 
 use crate::linux::wayland::{display::WaylandDisplay, serial::SerialKind};
-use crate::linux::{Globals, Output, WaylandClientStatePtr, get_window};
+use crate::linux::{
+    ClockReading, Globals, Output, PresentTicket, PresentTickets, WaylandClientStatePtr,
+    get_window, not_presented, presentation_refresh, presentation_sequence, presentation_stamp,
+};
 use gpui::{
     AnyWindowHandle, Bounds, Capslock, Decorations, DevicePixels, ExternalDragPayload,
     FrameRequestSource, GpuSpecs, Modifiers, Pixels, PlatformAtlas, PlatformDisplay,
-    PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformWindow, Point, PromptButton,
-    PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size, Tiling, WindowAppearance,
-    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
-    WindowKind, WindowParams, WindowVisibility,
+    PlatformFrameSignal, PlatformInput, PlatformInputHandler, PlatformPresentFeedback,
+    PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, Scene, Size,
+    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
+    WindowControls, WindowDecorations, WindowKind, WindowParams, WindowVisibility,
     layer_shell::{Anchor, LayerShellNotSupportedError},
     popup::PopupOptions,
     px, size,
@@ -60,6 +64,7 @@ pub(crate) struct Callbacks {
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     button_layout_changed: Option<Box<dyn FnMut()>>,
+    present_feedback: Option<Box<dyn FnMut(PlatformPresentFeedback)>>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -134,6 +139,10 @@ pub struct WaylandWindowState {
     redraw_requested: bool,
     presentation: PresentationState,
     pending_frame_callback: Option<wl_callback::WlCallback>,
+    /// How many times `PlatformWindow::draw` was called.
+    draw_calls: u64,
+    /// Set once present feedback was requested.
+    present_tickets: Option<PresentTickets>,
     in_progress_configure: Option<InProgressConfigure>,
     resize_throttle: bool,
     in_progress_window_controls: Option<WindowControls>,
@@ -636,6 +645,8 @@ impl WaylandWindowState {
             redraw_requested: false,
             presentation: PresentationState::Unpresented,
             pending_frame_callback: None,
+            draw_calls: 0,
+            present_tickets: None,
             in_progress_window_controls: None,
             window_controls: WindowControls::default(),
             client_inset: None,
@@ -824,6 +835,69 @@ impl WaylandWindow {
         self.0.state.borrow()
     }
 
+    /// Returns whether the scene was presented.
+    fn draw_scene(&self, scene: &Scene, draw_call: u64) -> bool {
+        let mut state = self.borrow_mut();
+        let state = &mut *state;
+        let Some(renderer) = &mut state.renderer else {
+            return false;
+        };
+
+        if renderer.device_lost() {
+            let raw_window = RawWindow {
+                window: state.surface.id().as_ptr().cast::<std::ffi::c_void>(),
+                display: state
+                    .surface
+                    .backend()
+                    .upgrade()
+                    .unwrap()
+                    .display_ptr()
+                    .cast::<std::ffi::c_void>(),
+            };
+            match renderer.recover(&raw_window) {
+                Ok(()) => {}
+                Err(err) => {
+                    log::warn!("GPU recovery failed, will retry on next frame: {err}");
+                }
+            }
+
+            state.redraw_requested = true;
+            return false;
+        }
+
+        // Surface state changed during this GPUI tick is included in this presentation.
+        state.redraw_requested = false;
+        if state.pending_frame_callback.is_none() {
+            let callback = state.surface.frame(&state.globals.qh, state.surface.id());
+            state.pending_frame_callback = Some(callback);
+        }
+        if state.present_tickets.is_some()
+            && let Some(presentation) = &state.globals.presentation
+        {
+            presentation.feedback(
+                &state.surface,
+                &state.globals.qh,
+                PresentTicket {
+                    surface_id: state.surface.id(),
+                    draw_call,
+                },
+            );
+        }
+        let presented = renderer.draw(scene);
+        if presented {
+            state.presentation = PresentationState::Presented;
+            self.0.frame_loop.set(FrameLoop::AwaitingCallback);
+        } else {
+            state.presentation = state.presentation.failed();
+            self.0.frame_loop.set(FrameLoop::PresentationFailed);
+        }
+
+        if renderer.needs_redraw() {
+            state.redraw_requested = true;
+        }
+        presented
+    }
+
     fn borrow_mut(&self) -> RefMut<'_, WaylandWindowState> {
         self.0.state.borrow_mut()
     }
@@ -888,6 +962,57 @@ impl WaylandWindow {
 }
 
 impl WaylandWindowStatePtr {
+    /// Answers the `wp_presentation_feedback` request of `draw_call`.
+    pub fn presentation_feedback_received(
+        &self,
+        draw_call: u64,
+        event: wp_presentation_feedback::Event,
+        clock_id: Option<libc::clockid_t>,
+    ) {
+        let feedback = {
+            let mut state = self.state.borrow_mut();
+            let Some(tickets) = state.present_tickets.as_mut() else {
+                return;
+            };
+            match event {
+                wp_presentation_feedback::Event::Presented {
+                    tv_sec_hi,
+                    tv_sec_lo,
+                    tv_nsec,
+                    refresh,
+                    seq_hi,
+                    seq_lo,
+                    ..
+                } => {
+                    let at = presentation_stamp(tv_sec_hi, tv_sec_lo, tv_nsec)
+                        .and_then(|stamp| ClockReading::read(clock_id?)?.instant_of(stamp));
+                    tickets.presented(
+                        draw_call,
+                        at,
+                        presentation_refresh(refresh),
+                        presentation_sequence(seq_hi, seq_lo),
+                    )
+                }
+                wp_presentation_feedback::Event::Discarded => tickets.discarded(draw_call),
+                _ => None,
+            }
+        };
+        if let Some(feedback) = feedback {
+            self.deliver_present_feedback(feedback);
+        }
+    }
+
+    fn deliver_present_feedback(&self, feedback: PlatformPresentFeedback) {
+        let callback = self.callbacks.borrow_mut().present_feedback.take();
+        if let Some(mut callback) = callback {
+            callback(feedback);
+            self.callbacks
+                .borrow_mut()
+                .present_feedback
+                .get_or_insert(callback);
+        }
+    }
+
     pub fn handle(&self) -> AnyWindowHandle {
         self.state.borrow().handle
     }
@@ -2009,51 +2134,41 @@ impl PlatformWindow for WaylandWindow {
     }
 
     fn draw(&self, scene: &Scene) {
-        let mut state = self.borrow_mut();
-        let state = &mut *state;
-        let Some(renderer) = &mut state.renderer else {
-            return;
+        let draw_call = {
+            let mut state = self.borrow_mut();
+            state.draw_calls += 1;
+            state.draw_calls
         };
-
-        if renderer.device_lost() {
-            let raw_window = RawWindow {
-                window: state.surface.id().as_ptr().cast::<std::ffi::c_void>(),
-                display: state
-                    .surface
-                    .backend()
-                    .upgrade()
-                    .unwrap()
-                    .display_ptr()
-                    .cast::<std::ffi::c_void>(),
-            };
-            match renderer.recover(&raw_window) {
-                Ok(()) => {}
-                Err(err) => {
-                    log::warn!("GPU recovery failed, will retry on next frame: {err}");
+        let submitted = Instant::now();
+        let presented = self.draw_scene(scene, draw_call);
+        let feedback = {
+            let mut state = self.borrow_mut();
+            match state.present_tickets.as_mut() {
+                Some(tickets) if presented => {
+                    tickets.submitted(draw_call, submitted);
+                    None
                 }
+                Some(_) => Some(not_presented(draw_call, submitted)),
+                None => None,
             }
+        };
+        if let Some(feedback) = feedback {
+            self.0.deliver_present_feedback(feedback);
+        }
+    }
 
-            state.redraw_requested = true;
-            return;
+    fn on_present_feedback(&self, callback: Box<dyn FnMut(PlatformPresentFeedback)>) -> bool {
+        {
+            let mut state = self.borrow_mut();
+            if state.globals.presentation.is_none() {
+                return false;
+            }
+            state
+                .present_tickets
+                .get_or_insert_with(PresentTickets::default);
         }
-
-        // Surface state changed during this GPUI tick is included in this presentation.
-        state.redraw_requested = false;
-        if state.pending_frame_callback.is_none() {
-            let callback = state.surface.frame(&state.globals.qh, state.surface.id());
-            state.pending_frame_callback = Some(callback);
-        }
-        if renderer.draw(scene) {
-            state.presentation = PresentationState::Presented;
-            self.0.frame_loop.set(FrameLoop::AwaitingCallback);
-        } else {
-            state.presentation = state.presentation.failed();
-            self.0.frame_loop.set(FrameLoop::PresentationFailed);
-        }
-
-        if renderer.needs_redraw() {
-            state.redraw_requested = true;
-        }
+        self.0.callbacks.borrow_mut().present_feedback = Some(callback);
+        true
     }
 
     fn schedule_frame(&self) {

@@ -1,14 +1,14 @@
 use anyhow::{Context as _, anyhow};
 use x11rb::connection::RequestConnection;
 
-use crate::linux::X11ClientStatePtr;
+use crate::linux::{ClockReading, CompleteNotifyQueue, X11ClientStatePtr, not_presented};
 use gpui::{
     AnyWindowHandle, Bounds, Decorations, DevicePixels, ForegroundExecutor, GpuSpecs, Modifiers,
-    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler, PlatformWindow,
-    Point, PromptButton, PromptLevel, RequestFrameOptions, ResizeEdge, ScaledPixels, Scene, Size,
-    Tiling, WindowAppearance, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowDecorations, WindowKind, WindowParams, WindowVisibility, popup::PopupNotSupportedError,
-    px,
+    Pixels, PlatformAtlas, PlatformDisplay, PlatformInput, PlatformInputHandler,
+    PlatformPresentFeedback, PlatformWindow, Point, PromptButton, PromptLevel, RequestFrameOptions,
+    ResizeEdge, ScaledPixels, Scene, Size, Tiling, WindowAppearance, WindowBackgroundAppearance,
+    WindowBounds, WindowControlArea, WindowDecorations, WindowKind, WindowParams, WindowVisibility,
+    popup::PopupNotSupportedError, px,
 };
 use gpui_wgpu::{CompositorGpuHint, WgpuRenderer, WgpuSurfaceConfig};
 
@@ -21,6 +21,7 @@ use x11rb::{
     errors::ConnectionError,
     properties::{WmHints, WmSizeHints},
     protocol::{
+        present::{self, ConnectionExt as _},
         sync,
         xinput::{self, ConnectionExt as _},
         xproto::{self, ClientMessageEvent, ConnectionExt, TranslateCoordinatesReply},
@@ -31,6 +32,7 @@ use x11rb::{
 
 use std::{
     cell::RefCell, ffi::c_void, fmt::Display, num::NonZeroU32, ptr::NonNull, rc::Rc, sync::Arc,
+    time::Instant,
 };
 
 use super::{X11Display, XINPUT_ALL_DEVICE_GROUPS, XINPUT_ALL_DEVICES};
@@ -254,6 +256,13 @@ pub struct Callbacks {
     close: Option<Box<dyn FnOnce()>>,
     appearance_changed: Option<Box<dyn FnMut()>>,
     button_layout_changed: Option<Box<dyn FnMut()>>,
+    present_feedback: Option<Box<dyn FnMut(PlatformPresentFeedback)>>,
+}
+
+/// The Present extension events this window selected, and the presents waiting for them.
+struct PresentCompletion {
+    event_id: present::Event,
+    queue: CompleteNotifyQueue,
 }
 
 pub struct X11WindowState {
@@ -292,6 +301,9 @@ pub struct X11WindowState {
     pub handle: AnyWindowHandle,
     last_insets: [u32; 4],
     accesskit_adapter: Option<accesskit_unix::Adapter>,
+    /// How many times `PlatformWindow::draw` was called.
+    draw_calls: u64,
+    present_completion: Option<PresentCompletion>,
 }
 
 impl X11WindowState {
@@ -858,6 +870,8 @@ impl X11WindowState {
                 accesskit_adapter: None,
                 counter_id: sync_request_counter,
                 last_sync_counter: None,
+                draw_calls: 0,
+                present_completion: None,
             })
         });
 
@@ -918,6 +932,42 @@ enum WmHintPropertyState {
 }
 
 impl X11Window {
+    /// Returns whether the scene was presented.
+    fn draw_scene(&self, scene: &Scene) -> bool {
+        let mut inner = self.0.state.borrow_mut();
+        let inner = &mut *inner;
+        let Some(renderer) = &mut inner.renderer else {
+            return false;
+        };
+
+        if renderer.device_lost() {
+            let raw_window = RawWindow {
+                connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
+                    &*self.0.xcb,
+                ) as *mut _,
+                screen_id: inner.x_screen_index,
+                window_id: self.0.x_window,
+                visual_id: inner.visual_id,
+            };
+            match renderer.recover(&raw_window) {
+                Ok(()) => {}
+                Err(err) => {
+                    log::warn!("GPU recovery failed, will retry on next frame: {err}");
+                }
+            }
+
+            inner.force_render_after_recovery = true;
+            return false;
+        }
+
+        let presented = renderer.draw(scene);
+
+        if renderer.needs_redraw() {
+            inner.force_render_after_recovery = true;
+        }
+        presented
+    }
+
     pub fn new(
         handle: AnyWindowHandle,
         client: X11ClientStatePtr,
@@ -1049,6 +1099,61 @@ impl X11Window {
 }
 
 impl X11WindowStatePtr {
+    /// Selects the Present extension's `CompleteNotify` events, before the window's first
+    /// present, so they pair with the presents in order.
+    pub(crate) fn listen_for_present_completion(&self) -> anyhow::Result<()> {
+        let event_id = self.xcb.generate_id()?;
+        check_reply(
+            || "X11 PresentSelectInput failed",
+            self.xcb.present_select_input(
+                event_id,
+                self.x_window,
+                present::EventMask::COMPLETE_NOTIFY,
+            ),
+        )?;
+        self.state.borrow_mut().present_completion = Some(PresentCompletion {
+            event_id,
+            queue: CompleteNotifyQueue::default(),
+        });
+        Ok(())
+    }
+
+    pub(crate) fn present_completed(&self, event: &present::CompleteNotifyEvent) {
+        let feedback = {
+            let mut state = self.state.borrow_mut();
+            let Some(completion) = state.present_completion.as_mut() else {
+                return;
+            };
+            if completion.event_id != event.event {
+                return;
+            }
+            completion.queue.complete(
+                event.kind,
+                event.mode,
+                event.ust,
+                event.msc,
+                ClockReading::read(libc::CLOCK_MONOTONIC),
+            )
+        };
+        self.deliver_present_feedback(feedback);
+    }
+
+    fn deliver_present_feedback(
+        &self,
+        feedback: impl IntoIterator<Item = PlatformPresentFeedback>,
+    ) {
+        let callback = self.callbacks.borrow_mut().present_feedback.take();
+        if let Some(mut callback) = callback {
+            for feedback in feedback {
+                callback(feedback);
+            }
+            self.callbacks
+                .borrow_mut()
+                .present_feedback
+                .get_or_insert(callback);
+        }
+    }
+
     pub fn should_close(&self) -> bool {
         let mut cb = self.callbacks.borrow_mut();
         if let Some(mut should_close) = cb.should_close.take() {
@@ -1749,37 +1854,30 @@ impl PlatformWindow for X11Window {
     }
 
     fn draw(&self, scene: &Scene) {
-        let mut inner = self.0.state.borrow_mut();
-        let inner = &mut *inner;
-        let Some(renderer) = &mut inner.renderer else {
-            return;
+        let draw_call = {
+            let mut state = self.0.state.borrow_mut();
+            state.draw_calls += 1;
+            state.draw_calls
         };
-
-        if renderer.device_lost() {
-            let raw_window = RawWindow {
-                connection: as_raw_xcb_connection::AsRawXcbConnection::as_raw_xcb_connection(
-                    &*self.0.xcb,
-                ) as *mut _,
-                screen_id: inner.x_screen_index,
-                window_id: self.0.x_window,
-                visual_id: inner.visual_id,
-            };
-            match renderer.recover(&raw_window) {
-                Ok(()) => {}
-                Err(err) => {
-                    log::warn!("GPU recovery failed, will retry on next frame: {err}");
-                }
+        let submitted = Instant::now();
+        let presented = self.draw_scene(scene);
+        let feedback = {
+            let mut state = self.0.state.borrow_mut();
+            match state.present_completion.as_mut() {
+                Some(completion) if presented => completion.queue.submitted(draw_call, submitted),
+                Some(_) => vec![not_presented(draw_call, submitted)],
+                None => Vec::new(),
             }
+        };
+        self.0.deliver_present_feedback(feedback);
+    }
 
-            inner.force_render_after_recovery = true;
-            return;
+    fn on_present_feedback(&self, callback: Box<dyn FnMut(PlatformPresentFeedback)>) -> bool {
+        if self.0.state.borrow().present_completion.is_none() {
+            return false;
         }
-
-        renderer.draw(scene);
-
-        if renderer.needs_redraw() {
-            inner.force_render_after_recovery = true;
-        }
+        self.0.callbacks.borrow_mut().present_feedback = Some(callback);
+        true
     }
 
     fn sprite_atlas(&self) -> Arc<dyn PlatformAtlas> {

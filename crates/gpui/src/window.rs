@@ -25,6 +25,7 @@ use crate::{
     WindowTextSystem, WindowVisibility, point, prelude::*, px, rems, size, transparent_black,
 };
 use crate::{ExternalSurface, PaintExternalSurface};
+use crate::{PlatformPresentFeedback, PresentOutcome};
 
 use crate::gestures::{GestureTuning, RecognizedTouchGesture, TouchGestureRecognizer};
 use crate::interactive::TouchEvent;
@@ -51,6 +52,7 @@ use std::{
     borrow::Cow,
     cell::{Cell, RefCell},
     cmp,
+    collections::VecDeque,
     fmt::{Debug, Display},
     hash::{Hash, Hasher},
     marker::PhantomData,
@@ -1221,6 +1223,94 @@ enum InputModality {
     Touch,
 }
 
+/// Names one [`Window::draw`] of a window: the number of draws the window started up to and
+/// including it.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Ord, PartialOrd)]
+pub struct DrawId(u64);
+
+/// The present feedback of the first present of one draw, delivered by
+/// [`Window::on_frame_presented`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FramePresented {
+    /// The draw whose frame this is.
+    pub draw: DrawId,
+    /// When the platform was handed the frame, right before it rendered and presented it.
+    pub submitted: Instant,
+    /// Whether and when the frame was shown.
+    pub outcome: PresentOutcome,
+}
+
+/// How many presented draws wait for their feedback at most; older ones get none.
+const PRESENTED_DRAWS_AWAITING_FEEDBACK: usize = 16;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PresentFeedbackSupport {
+    NotAsked,
+    Supported,
+    Unsupported,
+}
+
+/// Maps the platform's `draw` calls to the draws they presented first and forwards their
+/// feedback. Shared with the platform window's feedback callback, which runs outside of any
+/// window update.
+struct PresentFeedback {
+    support: Cell<PresentFeedbackSupport>,
+    draw_calls: Cell<u64>,
+    last_presented: Cell<Option<DrawId>>,
+    awaiting_feedback: RefCell<VecDeque<(u64, DrawId)>>,
+    subscribers: SubscriberSet<(), Box<dyn FnMut(&FramePresented) -> bool>>,
+}
+
+impl PresentFeedback {
+    fn new() -> Self {
+        Self {
+            support: Cell::new(PresentFeedbackSupport::NotAsked),
+            draw_calls: Cell::new(0),
+            last_presented: Cell::new(None),
+            awaiting_feedback: RefCell::new(VecDeque::new()),
+            subscribers: SubscriberSet::new(),
+        }
+    }
+
+    /// Counts a platform `draw` call of `draw`'s frame. Only its first one awaits feedback,
+    /// because presenting the same scene again shows no new picture.
+    fn record_draw_call(&self, draw: DrawId) {
+        let draw_call = self.draw_calls.get() + 1;
+        self.draw_calls.set(draw_call);
+        if self.last_presented.replace(Some(draw)) == Some(draw) {
+            return;
+        }
+        let mut awaiting_feedback = self.awaiting_feedback.borrow_mut();
+        if awaiting_feedback.len() == PRESENTED_DRAWS_AWAITING_FEEDBACK {
+            awaiting_feedback.pop_front();
+        }
+        awaiting_feedback.push_back((draw_call, draw));
+    }
+
+    fn deliver(&self, feedback: PlatformPresentFeedback) {
+        let draw = {
+            let mut awaiting_feedback = self.awaiting_feedback.borrow_mut();
+            let Some(index) = awaiting_feedback
+                .iter()
+                .position(|(draw_call, _)| *draw_call == feedback.draw_call)
+            else {
+                return;
+            };
+            awaiting_feedback.remove(index).map(|(_, draw)| draw)
+        };
+        let Some(draw) = draw else {
+            return;
+        };
+        let presented = FramePresented {
+            draw,
+            submitted: feedback.submitted,
+            outcome: feedback.outcome,
+        };
+        self.subscribers
+            .retain(&(), |callback| callback(&presented));
+    }
+}
+
 /// Holds the state for a specific window.
 pub struct Window {
     pub(crate) handle: AnyWindowHandle,
@@ -1282,6 +1372,9 @@ pub struct Window {
         SubscriberSet<(), Box<dyn FnMut(WindowVisibility, &mut Window, &mut App) -> bool>>,
     hovered: Rc<Cell<bool>>,
     pub(crate) needs_present: Rc<Cell<bool>>,
+    draws_started: u64,
+    rendered_draw: DrawId,
+    present_feedback: Rc<PresentFeedback>,
     /// Tracks recent input event timestamps to determine if input is arriving at a high rate.
     /// Used to selectively enable VRR optimization only when input rate exceeds 60fps.
     pub(crate) input_rate_tracker: Rc<RefCell<InputRateTracker>>,
@@ -2185,6 +2278,9 @@ impl Window {
             visibility_observers: SubscriberSet::new(),
             hovered,
             needs_present,
+            draws_started: 0,
+            rendered_draw: DrawId::default(),
+            present_feedback: Rc::new(PresentFeedback::new()),
             input_rate_tracker,
             #[cfg(feature = "profiler")]
             window_profiler: profiler::WindowProfiler::new(handle.window_id())?,
@@ -3446,6 +3542,7 @@ impl Window {
         let frame_dirty = self.invalidator.take_frame_dirty();
         #[cfg(feature = "profiler")]
         self.window_profiler.begin_draw();
+        self.draws_started += 1;
 
         // Set up the per-App arena for element allocation during this draw.
         // This ensures that multiple test Apps have isolated arenas.
@@ -3530,6 +3627,7 @@ impl Window {
         let previous_focus_path = self.rendered_frame.focus_path();
         let previous_window_active = self.rendered_frame.window_active;
         mem::swap(&mut self.rendered_frame, &mut self.next_frame);
+        self.rendered_draw = DrawId(self.draws_started);
         self.next_frame.clear();
         let current_focus_path = self.rendered_frame.focus_path();
         let current_window_active = self.rendered_frame.window_active;
@@ -3625,6 +3723,7 @@ impl Window {
         let _foreground_turn = profiler::journal::foreground_turn();
         #[cfg(feature = "profiler")]
         let present_start = Instant::now();
+        self.present_feedback.record_draw_call(self.rendered_draw);
         self.platform_window.draw(&self.rendered_frame.scene);
         #[cfg(feature = "profiler")]
         self.window_profiler.record_present(
@@ -3635,6 +3734,53 @@ impl Window {
         );
         self.needs_present.set(false);
         profiling::finish_frame!();
+    }
+
+    /// The draw that is painting now, or the last one when no draw is in progress. Elements
+    /// that paint something whose display time matters record it, so a [`FramePresented`] for
+    /// this draw tells them when it was shown.
+    pub fn draw_id(&self) -> DrawId {
+        DrawId(self.draws_started)
+    }
+
+    /// Calls `callback` once for the first present of each later draw with whether and when the
+    /// platform showed it. A draw that a newer draw replaced before it was presented gets none.
+    /// Returns `None` when the platform reports no present feedback.
+    ///
+    /// The callback runs on the main thread, possibly while this window draws, so it must not
+    /// borrow the app (for example through an [`AsyncApp`](crate::AsyncApp)).
+    pub fn on_frame_presented(
+        &self,
+        mut callback: impl FnMut(&FramePresented) + 'static,
+    ) -> Option<Subscription> {
+        let present_feedback = &self.present_feedback;
+        if present_feedback.support.get() == PresentFeedbackSupport::NotAsked {
+            let supported = self.platform_window.on_present_feedback(Box::new({
+                let present_feedback = Rc::downgrade(present_feedback);
+                move |feedback| {
+                    if let Some(present_feedback) = present_feedback.upgrade() {
+                        present_feedback.deliver(feedback);
+                    }
+                }
+            }));
+            present_feedback.support.set(if supported {
+                PresentFeedbackSupport::Supported
+            } else {
+                PresentFeedbackSupport::Unsupported
+            });
+        }
+        if present_feedback.support.get() != PresentFeedbackSupport::Supported {
+            return None;
+        }
+        let (subscription, activate) = present_feedback.subscribers.insert(
+            (),
+            Box::new(move |presented| {
+                callback(presented);
+                true
+            }),
+        );
+        activate();
+        Some(subscription)
     }
 
     /// Presents the most recently drawn frame if it hasn't been presented yet.
@@ -9996,5 +10142,198 @@ mod inspector_tests {
             }
         })
         .expect("closed inspector has no bookkeeping and no style overrides");
+    }
+}
+
+#[cfg(test)]
+mod present_feedback_tests {
+    use std::{
+        cell::{Cell, RefCell},
+        rc::Rc,
+    };
+
+    use scheduler::Instant;
+
+    use crate::{
+        AnyWindowHandle, App, AppContext as _, Context, DrawId, Empty, FramePresented, IntoElement,
+        PlatformPresentFeedback, PresentOutcome, Render, Subscription, TestAppContext, Window,
+    };
+
+    /// Records the draw that rendered it last.
+    struct PaintedDraw(Rc<Cell<Option<DrawId>>>);
+
+    impl Render for PaintedDraw {
+        fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            self.0.set(Some(window.draw_id()));
+            Empty
+        }
+    }
+
+    /// Opens a test window and returns it with the draw its root view last rendered in.
+    fn painted_draw_window(cx: &mut TestAppContext) -> (AnyWindowHandle, Rc<Cell<Option<DrawId>>>) {
+        let painted = Rc::new(Cell::new(None));
+        let window = cx.add_window({
+            let painted = painted.clone();
+            move |_, _| PaintedDraw(painted)
+        });
+        (window.into(), painted)
+    }
+
+    /// Runs `f` on the window without leasing its root view, so `f` can draw it.
+    fn with_window(
+        cx: &mut TestAppContext,
+        window: AnyWindowHandle,
+        f: impl FnOnce(&mut Window, &mut App),
+    ) {
+        cx.update(|cx| cx.update_window(window, |_, window, cx| f(window, cx)))
+            .expect("window exists");
+    }
+
+    fn record_presented(window: &Window) -> (Rc<RefCell<Vec<FramePresented>>>, Subscription) {
+        let reports = Rc::new(RefCell::new(Vec::new()));
+        let subscription = window
+            .on_frame_presented({
+                let reports = reports.clone();
+                move |presented| reports.borrow_mut().push(*presented)
+            })
+            .expect("the test platform reports present feedback");
+        (reports, subscription)
+    }
+
+    #[gpui::test]
+    fn a_presented_draw_reaches_the_subscriber_once_with_its_draw_id(cx: &mut TestAppContext) {
+        let (window, painted) = painted_draw_window(cx);
+        with_window(cx, window, |window, cx| {
+            let (reports, _subscription) = record_presented(window);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let draw = window.draw_id();
+            assert_eq!(
+                painted.get(),
+                Some(draw),
+                "render saw the draw that painted it"
+            );
+            window.present();
+
+            let reports = reports.borrow();
+            assert_eq!(
+                reports.len(),
+                1,
+                "one report per presented draw: {reports:?}"
+            );
+            assert_eq!(reports[0].draw, draw);
+            match reports[0].outcome {
+                PresentOutcome::Presented { at, .. } => assert!(at >= reports[0].submitted),
+                outcome => panic!("the test window presents every draw, got {outcome:?}"),
+            }
+        });
+    }
+
+    #[gpui::test]
+    fn a_re_present_of_the_same_draw_is_not_reported_again(cx: &mut TestAppContext) {
+        let (window, _) = painted_draw_window(cx);
+        with_window(cx, window, |window, cx| {
+            let (reports, _subscription) = record_presented(window);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            window.present();
+            window.present();
+            assert_eq!(reports.borrow().len(), 1);
+
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let second = window.draw_id();
+            window.present();
+            let reports = reports.borrow();
+            assert_eq!(reports.len(), 2);
+            assert_eq!(reports[1].draw, second);
+        });
+    }
+
+    #[gpui::test]
+    fn a_draw_replaced_before_any_present_gets_no_feedback(cx: &mut TestAppContext) {
+        let (window, _) = painted_draw_window(cx);
+        with_window(cx, window, |window, cx| {
+            let (reports, _subscription) = record_presented(window);
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let replaced = window.draw_id();
+            window.refresh();
+            window.draw(cx).clear(cx);
+            let shown = window.draw_id();
+            assert_ne!(replaced, shown);
+            window.present();
+
+            let draws = reports
+                .borrow()
+                .iter()
+                .map(|presented| presented.draw)
+                .collect::<Vec<_>>();
+            assert_eq!(draws, [shown]);
+        });
+    }
+
+    #[gpui::test]
+    fn feedback_for_an_unknown_draw_call_is_dropped(cx: &mut TestAppContext) {
+        let (window, _) = painted_draw_window(cx);
+        with_window(cx, window, |window, _| {
+            let (reports, _subscription) = record_presented(window);
+            let test_window = window
+                .platform_window
+                .as_test()
+                .expect("a test platform window");
+            test_window.simulate_present_feedback(PlatformPresentFeedback {
+                draw_call: 1_000,
+                submitted: Instant::now(),
+                outcome: PresentOutcome::Unknown,
+            });
+            assert!(reports.borrow().is_empty());
+        });
+    }
+
+    #[gpui::test]
+    fn late_feedback_reaches_the_draw_of_its_draw_call(cx: &mut TestAppContext) {
+        let (window, _) = painted_draw_window(cx);
+        with_window(cx, window, |window, _| {
+            let (reports, _subscription) = record_presented(window);
+            let (first, second) = (super::DrawId(100), super::DrawId(101));
+            let base = window.present_feedback.draw_calls.get();
+            window.present_feedback.record_draw_call(first);
+            window.present_feedback.record_draw_call(first);
+            window.present_feedback.record_draw_call(second);
+
+            let test_window = window
+                .platform_window
+                .as_test()
+                .expect("a test platform window");
+            for draw_call in [base + 3, base + 2, base + 1] {
+                test_window.simulate_present_feedback(PlatformPresentFeedback {
+                    draw_call,
+                    submitted: Instant::now(),
+                    outcome: PresentOutcome::Unknown,
+                });
+            }
+
+            let draws = reports
+                .borrow()
+                .iter()
+                .map(|presented| presented.draw)
+                .collect::<Vec<_>>();
+            assert_eq!(draws, [second, first]);
+        });
+    }
+
+    #[gpui::test]
+    fn a_platform_without_feedback_gives_no_subscription(cx: &mut TestAppContext) {
+        let (window, _) = painted_draw_window(cx);
+        with_window(cx, window, |window, _| {
+            window
+                .platform_window
+                .as_test()
+                .expect("a test platform window")
+                .set_present_feedback_supported(false);
+            assert!(window.on_frame_presented(|_| {}).is_none());
+            assert!(window.on_frame_presented(|_| {}).is_none());
+        });
     }
 }

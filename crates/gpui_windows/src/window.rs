@@ -408,6 +408,7 @@ pub(crate) struct Callbacks {
     pub(crate) close: Cell<Option<Box<dyn FnOnce()>>>,
     pub(crate) hit_test_window_control: Cell<Option<Box<dyn FnMut() -> Option<WindowControlArea>>>>,
     pub(crate) appearance_changed: Cell<Option<Box<dyn FnMut()>>>,
+    pub(crate) present_feedback: Cell<Option<Box<dyn FnMut(PlatformPresentFeedback)>>>,
 }
 
 struct WindowCreateContext {
@@ -1039,6 +1040,12 @@ impl PlatformWindow for WindowsWindow {
             .borrow_mut()
             .draw(scene, self.state.background_appearance.get())
             .log_err();
+    }
+
+    fn on_present_feedback(&self, callback: Box<dyn FnMut(PlatformPresentFeedback)>) -> bool {
+        self.state.callbacks.present_feedback.set(Some(callback));
+        self.state.renderer.borrow_mut().enable_present_feedback();
+        true
     }
 
     #[cfg(any(test, feature = "test-support"))]
